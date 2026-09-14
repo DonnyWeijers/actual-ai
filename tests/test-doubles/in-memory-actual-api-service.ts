@@ -6,6 +6,7 @@ import {
 } from '@actual-app/core/src/server/api-models';
 import { RuleEntity, TransactionEntity } from '@actual-app/core/src/types/models';
 import { ActualApiServiceI } from '../../src/types';
+import metrics from '../../src/utils/metrics';
 
 export default class InMemoryActualApiService implements ActualApiServiceI {
   private categoryGroups: APICategoryGroupEntity[] = [];
@@ -19,6 +20,11 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
   private transactions: TransactionEntity[] = [];
 
   private wasBankSyncRan = false;
+
+  // Monotonic, not Date.now(): concurrent creates (the real CategorySuggester fans
+  // out with Promise.all) can land in the same millisecond and previously minted
+  // colliding ids.
+  private nextId = 0;
 
   private rules: RuleEntity[] = [];
 
@@ -37,6 +43,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
   }
 
   async getCategoryGroups(): Promise<APICategoryGroupEntity[]> {
+    metrics.incr('actual_read_calls');
     return Promise.resolve(this.categoryGroups);
   }
 
@@ -45,6 +52,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
   }
 
   async getCategories(): Promise<(APICategoryEntity | APICategoryGroupEntity)[]> {
+    metrics.incr('actual_read_calls');
     return Promise.resolve(this.categories);
   }
 
@@ -53,6 +61,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
   }
 
   async getAccounts(): Promise<APIAccountEntity[]> {
+    metrics.incr('actual_read_calls');
     return Promise.resolve(this.accounts);
   }
 
@@ -61,6 +70,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
   }
 
   async getPayees(): Promise<APIPayeeEntity[]> {
+    metrics.incr('actual_read_calls');
     return Promise.resolve(this.payees);
   }
 
@@ -69,6 +79,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
   }
 
   async getTransactions(): Promise<TransactionEntity[]> {
+    metrics.incr('actual_read_calls');
     return Promise.resolve(this.transactions);
   }
 
@@ -80,7 +91,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
     if (this.isDryRun) {
       return Promise.resolve();
     }
-    return new Promise((resolve) => {
+    return metrics.timeAsync('transaction_update_ms', async () => new Promise<void>((resolve) => {
       const transaction = this.transactions.find((t) => t.id === id);
 
       if (!transaction) {
@@ -88,7 +99,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
       }
       transaction.notes = notes;
       resolve();
-    });
+    }));
   }
 
   async updateTransactionNotesAndCategory(
@@ -99,7 +110,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
     if (this.isDryRun) {
       return Promise.resolve();
     }
-    return new Promise((resolve) => {
+    return metrics.timeAsync('transaction_update_ms', async () => new Promise<void>((resolve) => {
       const transaction = this.transactions.find((t) => t.id === id);
       if (!transaction) {
         throw new Error(`Transaction with id ${id} not found`);
@@ -107,7 +118,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
       transaction.notes = notes;
       transaction.category = categoryId;
       resolve();
-    });
+    }));
   }
 
   async runBankSync(): Promise<void> {
@@ -120,41 +131,49 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
   }
 
   async createCategory(name: string, groupId: string): Promise<string> {
-    const categoryId = `cat-${Date.now()}`;
-    const newCategory: APICategoryEntity = {
-      id: categoryId,
-      name,
-      group_id: groupId,
-      is_income: false,
-    };
+    return metrics.timeAsync('category_creation_ms', async () => {
+      this.nextId += 1;
+      const categoryId = `cat-${this.nextId}`;
+      const newCategory: APICategoryEntity = {
+        id: categoryId,
+        name,
+        group_id: groupId,
+        is_income: false,
+      };
 
-    this.categories.push(newCategory);
+      this.categories.push(newCategory);
 
-    // Update the category group to include this category
-    const groupIndex = this.categoryGroups.findIndex((group) => group.id === groupId);
-    if (groupIndex >= 0) {
-      if (!this.categoryGroups[groupIndex].categories) {
-        this.categoryGroups[groupIndex].categories = [];
+      // Update the category group to include this category
+      const groupIndex = this.categoryGroups.findIndex((group) => group.id === groupId);
+      if (groupIndex >= 0) {
+        if (!this.categoryGroups[groupIndex].categories) {
+          this.categoryGroups[groupIndex].categories = [];
+        }
+        this.categoryGroups[groupIndex].categories.push(newCategory);
       }
-      this.categoryGroups[groupIndex].categories.push(newCategory);
-    }
 
-    return Promise.resolve(categoryId);
+      metrics.incr('categories_created');
+      return categoryId;
+    });
   }
 
   async createCategoryGroup(name: string): Promise<string> {
-    const groupId = `group-${Date.now()}`;
-    const newGroup: APICategoryGroupEntity = {
-      id: groupId,
-      name,
-      is_income: false,
-      categories: [],
-    };
+    return metrics.timeAsync('category_creation_ms', async () => {
+      this.nextId += 1;
+      const groupId = `group-${this.nextId}`;
+      const newGroup: APICategoryGroupEntity = {
+        id: groupId,
+        name,
+        is_income: false,
+        categories: [],
+      };
 
-    this.categoryGroups.push(newGroup);
-    this.categories.push(newGroup);
+      this.categoryGroups.push(newGroup);
+      this.categories.push(newGroup);
+      metrics.incr('groups_created');
 
-    return Promise.resolve(groupId);
+      return groupId;
+    });
   }
 
   async updateCategoryGroup(id: string, name: string): Promise<void> {
@@ -173,6 +192,7 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
   }
 
   async getRules(): Promise<RuleEntity[]> {
+    metrics.incr('actual_read_calls');
     return Promise.resolve(this.rules);
   }
 

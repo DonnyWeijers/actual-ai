@@ -6,6 +6,7 @@ import {
 import RateLimiter from './utils/rate-limiter';
 import { PROVIDER_LIMITS } from './utils/provider-limits';
 import { parseLlmResponse } from './utils/json-utils';
+import metrics from './utils/metrics';
 
 // Mirrors UnifiedResponse. Used only for the Ollama provider's structured-output
 // path (see ask()), where Ollama grammar-constrains decoding to this exact shape
@@ -113,8 +114,11 @@ export default class LlmService implements LlmServiceI {
   public async ask(prompt: string): Promise<UnifiedResponse> {
     try {
       console.log(`Making LLM request to ${this.provider}`);
+      metrics.incr('llm_requests');
+      metrics.incr('llm_prompt_chars_total', prompt.length);
+      const requestStart = Date.now();
 
-      return await this.rateLimiter.executeWithRateLimiting(this.provider, async () => {
+      const result = await this.rateLimiter.executeWithRateLimiting(this.provider, async () => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeoutMs);
         try {
@@ -150,6 +154,8 @@ export default class LlmService implements LlmServiceI {
           clearTimeout(timer);
         }
       });
+      metrics.addMs('llm_request_ms_total', Date.now() - requestStart);
+      return result;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.error(`Error during LLM request to ${this.provider}: ${errorMsg}`);

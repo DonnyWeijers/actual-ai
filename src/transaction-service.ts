@@ -6,6 +6,7 @@ import type {
   TransactionServiceI,
 } from './types';
 import { isFeatureEnabled } from './config';
+import metrics from './utils/metrics';
 import CategorySuggester from './transaction/category-suggester';
 import BatchTransactionProcessor from './transaction/batch-transaction-processor';
 import TransactionFilterer from './transaction/transaction-filterer';
@@ -83,6 +84,7 @@ class TransactionService implements TransactionServiceI {
 
     // Create new categories if not in dry run mode
     if (isFeatureEnabled('suggestNewCategories') && suggestedCategories.size > 0) {
+      metrics.incr('category_suggestions_unique', suggestedCategories.size);
       await this.categorySuggester.suggest(
         suggestedCategories,
         uncategorizedTransactions,

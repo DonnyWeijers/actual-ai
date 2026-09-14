@@ -2,6 +2,7 @@ import { CategoryEntity, TransactionEntity } from '@actual-app/core/src/types/mo
 import type {
   ProcessingStrategyI, UnifiedResponse,
 } from '../../types';
+import metrics from '../../utils/metrics';
 
 class NewCategoryStrategy implements ProcessingStrategyI {
   public isSatisfiedBy(response: UnifiedResponse): boolean {
@@ -26,6 +27,7 @@ class NewCategoryStrategy implements ProcessingStrategyI {
     if (response.newCategory === undefined) {
       throw new Error('No newCategory in response');
     }
+    metrics.incr('category_suggestions_raw');
     const categoryKey = `${response.newCategory.groupName}:${response.newCategory.name}`;
 
     const existing = suggestedCategories.get(categoryKey);

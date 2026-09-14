@@ -2,6 +2,7 @@ import type {
   TransactionEntity,
 } from '@actual-app/core/src/types/models';
 import SimilarityCalculator from './similarity-calculator';
+import metrics from './utils/metrics';
 
 class CategorySuggestionOptimizer {
   private readonly similarityCalculator: SimilarityCalculator;
@@ -97,6 +98,7 @@ class CategorySuggestionOptimizer {
       });
     });
 
+    metrics.incr('category_suggestions_merged', optimizedCategories.size);
     console.log(`Optimized from ${suggestions.length} to ${optimizedCategories.size} categories`);
     optimizedCategories.forEach((category) => {
       if (category.originalNames.length > 1) {

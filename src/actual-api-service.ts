@@ -7,6 +7,7 @@ import {
 import { TransactionEntity, RuleEntity } from '@actual-app/core/src/types/models';
 import { ActualApiServiceI } from './types';
 import DataDirLock from './utils/data-dir-lock';
+import metrics from './utils/metrics';
 
 class ActualApiService implements ActualApiServiceI {
   private actualApiClient: typeof import('@actual-app/api');
@@ -101,21 +102,25 @@ class ActualApiService implements ActualApiServiceI {
   }
 
   public async getCategoryGroups(): Promise<APICategoryGroupEntity[]> {
+    metrics.incr('actual_read_calls');
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return this.actualApiClient.getCategoryGroups();
   }
 
   public async getCategories(): Promise<(APICategoryEntity | APICategoryGroupEntity)[]> {
+    metrics.incr('actual_read_calls');
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return this.actualApiClient.getCategories();
   }
 
   public async getPayees(): Promise<APIPayeeEntity[]> {
+    metrics.incr('actual_read_calls');
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return this.actualApiClient.getPayees();
   }
 
   public async getAccounts(): Promise<APIAccountEntity[]> {
+    metrics.incr('actual_read_calls');
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return this.actualApiClient.getAccounts();
   }
@@ -125,6 +130,7 @@ class ActualApiService implements ActualApiServiceI {
     const accounts = await this.getAccounts();
     // eslint-disable-next-line no-restricted-syntax
     for (const account of accounts) {
+      metrics.incr('actual_read_calls');
       transactions = transactions.concat(
         // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         await this.actualApiClient.getTransactions(account.id, '1990-01-01', '2030-01-01'),
@@ -134,11 +140,13 @@ class ActualApiService implements ActualApiServiceI {
   }
 
   public async getRules(): Promise<RuleEntity[]> {
+    metrics.incr('actual_read_calls');
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return this.actualApiClient.getRules();
   }
 
   public async getPayeeRules(payeeId: string): Promise<RuleEntity[]> {
+    metrics.incr('actual_read_calls');
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return this.actualApiClient.getPayeeRules(payeeId);
   }
@@ -148,7 +156,9 @@ class ActualApiService implements ActualApiServiceI {
       console.log(`DRY RUN: Would update transaction notes of ${id} to: ${notes}`);
       return;
     }
-    await this.actualApiClient.updateTransaction(id, { notes });
+    await metrics.timeAsync('transaction_update_ms', async () => {
+      await this.actualApiClient.updateTransaction(id, { notes });
+    });
   }
 
   public async updateTransactionNotesAndCategory(
@@ -160,7 +170,9 @@ class ActualApiService implements ActualApiServiceI {
       console.log(`DRY RUN: Would update transaction notes ${id} to: ${notes} and category to ${categoryId}`);
       return;
     }
-    await this.actualApiClient.updateTransaction(id, { notes, category: categoryId });
+    await metrics.timeAsync('transaction_update_ms', async () => {
+      await this.actualApiClient.updateTransaction(id, { notes, category: categoryId });
+    });
   }
 
   public async runBankSync(): Promise<void> {
@@ -177,10 +189,14 @@ class ActualApiService implements ActualApiServiceI {
       return 'dry run';
     }
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const result = await this.actualApiClient.createCategory({
-      name,
-      group_id: groupId,
-    });
+    const result = await metrics.timeAsync(
+      'category_creation_ms',
+      async () => this.actualApiClient.createCategory({
+        name,
+        group_id: groupId,
+      }),
+    );
+    metrics.incr('categories_created');
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return result;
@@ -191,10 +207,14 @@ class ActualApiService implements ActualApiServiceI {
       console.log(`DRY RUN: Would create category group: ${name}`);
       return 'dry run';
     }
+    metrics.incr('groups_created');
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    return this.actualApiClient.createCategoryGroup({
-      name,
-    });
+    return metrics.timeAsync(
+      'category_creation_ms',
+      async () => this.actualApiClient.createCategoryGroup({
+        name,
+      }),
+    );
   }
 
   public async updateCategoryGroup(id: string, name: string): Promise<void> {

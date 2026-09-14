@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { tool, Tool } from 'ai';
 import { ToolServiceI } from '../types';
 import { getEnabledTools } from '../config';
+import metrics from './metrics';
 
 interface SearchResult {
   title: string;
@@ -147,9 +148,13 @@ export default class ToolService implements ToolServiceI {
   }): Promise<string> {
     const normalizedQuery = this.normalizeQuery(query);
     if (!normalizedQuery) return unavailableMessage;
+    metrics.incr('web_search_requests');
     const cacheKey = normalizedQuery.toLowerCase();
     const cached = this.getCachedResult(cache, cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      metrics.incr('web_search_cache_hits');
+      return cached;
+    }
     console.log(`Performing ${searchTypeLabel} for ${normalizedQuery}`);
     const result = await executor(normalizedQuery);
     this.setCachedResult(cache, cacheKey, result);

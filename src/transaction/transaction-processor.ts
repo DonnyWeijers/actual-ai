@@ -10,6 +10,7 @@ import {
 } from '../types';
 import TagService from './tag-service';
 import PayeeCategoryCache from './payee-category-cache';
+import metrics from '../utils/metrics';
 
 class TransactionProcessor {
   private readonly actualApiService: ActualApiServiceI;
@@ -55,7 +56,11 @@ class TransactionProcessor {
       }>,
   ): Promise<void> {
     try {
+      metrics.incr('transactions_processed');
       const cachedResponse = this.payeeCategoryCache.get(transaction.payee);
+      if (cachedResponse) {
+        metrics.incr('llm_cache_hits');
+      }
       const response = cachedResponse ?? await (async () => {
         const prompt = this.promptGenerator.generate(
           categoryGroups,

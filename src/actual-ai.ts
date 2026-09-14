@@ -4,6 +4,7 @@ import {
 import suppressConsoleLogsAsync from './utils';
 import { formatError } from './utils/error-utils';
 import { isFeatureEnabled } from './config';
+import metrics from './utils/metrics';
 
 class ActualAiService implements ActualAiServiceI {
   private readonly transactionService: TransactionServiceI;
@@ -20,6 +21,8 @@ class ActualAiService implements ActualAiServiceI {
 
   public async classify() {
     console.log('Starting classification process');
+    metrics.reset();
+    const runStart = Date.now();
     let isBudgetOpen = false;
     try {
       await this.actualApiService.initializeApi();
@@ -64,6 +67,8 @@ class ActualAiService implements ActualAiServiceI {
       } catch (shutdownError) {
         console.error('Error during API shutdown:', formatError(shutdownError));
       }
+      metrics.addMs('classification_run_ms', Date.now() - runStart);
+      metrics.logSummary();
     }
   }
 

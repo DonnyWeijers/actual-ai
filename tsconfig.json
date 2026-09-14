@@ -15,5 +15,6 @@
       "@actual-app/core": ["./src/shims/empty"],
       "@actual-app/core/*": ["./src/shims/empty"]
     }
-  }
+  },
+  "exclude": ["scripts"]
 }

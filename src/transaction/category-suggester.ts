@@ -3,6 +3,7 @@ import type { ActualApiServiceI } from '../types';
 import { APICategoryEntity, APICategoryGroupEntity } from '../types';
 import CategorySuggestionOptimizer from '../category-suggestion-optimizer';
 import TagService from './tag-service';
+import metrics from '../utils/metrics';
 
 class CategorySuggester {
   private readonly actualApiService: ActualApiServiceI;
@@ -32,6 +33,11 @@ class CategorySuggester {
     uncategorizedTransactions: TransactionEntity[],
     categoryGroups: APICategoryGroupEntity[],
   ): Promise<void> {
+    metrics.incr(
+      'existing_category_count',
+      categoryGroups.reduce((sum, group) => sum + (group.categories?.length ?? 0), 0),
+    );
+
     // Optimize categories before applying/reporting
     const optimizedCategories = this.categorySuggestionOptimizer
       .optimizeCategorySuggestions(suggestedCategories);
@@ -53,6 +59,7 @@ class CategorySuggester {
         (g) => g.name.toLowerCase() === groupName.toLowerCase(),
       );
       if (existing) {
+        metrics.incr('existing_group_count');
         groupIdByName.set(groupName, existing.id);
       } else {
         try {
@@ -82,6 +89,7 @@ class CategorySuggester {
       const key = CategorySuggester.categoryKey(groupId, name);
       const existingId = existingCategoryIds.get(key);
       if (existingId) {
+        metrics.incr('categories_reused');
         console.log(`Reusing existing category "${name}" with ID ${existingId}`);
         return existingId;
       }
@@ -134,6 +142,7 @@ class CategorySuggester {
       if (existingId === undefined) {
         throw error;
       }
+      metrics.incr('categories_reused');
       console.log(`Category "${name}" already exists, reusing ID ${existingId}`);
       return existingId;
     }
