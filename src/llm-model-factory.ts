@@ -132,7 +132,12 @@ class LlmModelFactory implements LlmModelFactoryI {
         const ollama = createOllama({
           baseURL: this.ollamaBaseURL,
         });
-        return ollama(this.ollamaModel);
+        // structuredOutputs makes the provider send Ollama's native JSON-schema
+        // `format` field on object-generation calls, so the server grammar-
+        // constrains decoding to the schema instead of hoping the model's free
+        // text happens to parse. See LlmService, which uses generateObject for
+        // this provider specifically.
+        return ollama(this.ollamaModel, { structuredOutputs: true });
       }
       case 'groq': {
         const groq = createGroq({

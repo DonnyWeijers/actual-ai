@@ -55,6 +55,7 @@ import CategorySuggester from './transaction/category-suggester';
 import BatchTransactionProcessor from './transaction/batch-transaction-processor';
 import TransactionProcessor from './transaction/transaction-processor';
 import TransactionFilterer from './transaction/transaction-filterer';
+import PayeeCategoryCache from './transaction/payee-category-cache';
 import RateLimiter from './utils/rate-limiter';
 
 // Create tool service if API key is available and tools are enabled
@@ -134,17 +135,21 @@ const categorySuggester = new CategorySuggester(
 
 const newCategoryStrategy = new NewCategoryStrategy();
 
+const payeeCategoryCache = new PayeeCategoryCache();
+
 const transactionProcessor = new TransactionProcessor(
   actualApiService,
   llmService,
   promptGenerator,
   tagService,
   [ruleMatchStrategy, existingCategoryStrategy, newCategoryStrategy],
+  payeeCategoryCache,
 );
 
 const batchTransactionProcessor = new BatchTransactionProcessor(
   transactionProcessor,
   20,
+  payeeCategoryCache,
 );
 
 const transactionFilterer = new TransactionFilterer(tagService);

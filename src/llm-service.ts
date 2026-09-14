@@ -1,10 +1,25 @@
-import { generateText, LanguageModel } from 'ai';
+import { generateObject, generateText, LanguageModel } from 'ai';
+import { z } from 'zod';
 import {
   LlmModelFactoryI, LlmServiceI, ToolServiceI, UnifiedResponse,
 } from './types';
 import RateLimiter from './utils/rate-limiter';
 import { PROVIDER_LIMITS } from './utils/provider-limits';
 import { parseLlmResponse } from './utils/json-utils';
+
+// Mirrors UnifiedResponse. Used only for the Ollama provider's structured-output
+// path (see ask()), where Ollama grammar-constrains decoding to this exact shape
+// instead of hoping the model's free text happens to be parsable JSON.
+const unifiedResponseSchema = z.object({
+  type: z.enum(['existing', 'new', 'rule']),
+  categoryId: z.string().optional(),
+  ruleName: z.string().optional(),
+  newCategory: z.object({
+    name: z.string(),
+    groupName: z.string(),
+    groupIsNew: z.boolean(),
+  }).optional(),
+});
 
 export default class LlmService implements LlmServiceI {
   private readonly model: LanguageModel;
@@ -102,8 +117,23 @@ export default class LlmService implements LlmServiceI {
       return await this.rateLimiter.executeWithRateLimiting(this.provider, async () => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-        const tools = this.supportsToolCalling() ? this.toolService?.getTools() : undefined;
         try {
+          if (this.provider === 'ollama') {
+            // Ollama gets a schema-constrained call instead of free text: the server
+            // grammar-constrains decoding to unifiedResponseSchema (see
+            // llm-model-factory's structuredOutputs: true), so this can't come back
+            // malformed or empty the way free-text JSON occasionally did.
+            const { object } = await generateObject({
+              model: this.model,
+              prompt,
+              temperature: this.temperature ?? 0.2,
+              schema: unifiedResponseSchema,
+              abortSignal: controller.signal,
+            });
+            return object;
+          }
+
+          const tools = this.supportsToolCalling() ? this.toolService?.getTools() : undefined;
           const { text } = await generateText({
             model: this.model,
             prompt,
