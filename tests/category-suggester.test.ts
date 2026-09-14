@@ -167,4 +167,68 @@ describe('CategorySuggester', () => {
 
     expect(getCategories).toHaveBeenCalledTimes(2);
   });
+
+  test('creates many categories with bounded, not unbounded, concurrency', async () => {
+    const groups = [{ id: 'g1', name: 'Bills', categories: [] }];
+    actualApiService.setCategoryGroups(groups);
+    let active = 0;
+    let peak = 0;
+    jest.spyOn(actualApiService, 'createCategory').mockImplementation(async (name) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => { setTimeout(resolve, 5); });
+      active -= 1;
+      return `cat-${name}`;
+    });
+
+    // Genuinely distinct names — near-identical ones (e.g. "Category 0".."Category
+    // 19") would get merged by the similarity optimizer before creation, leaving
+    // nothing to run concurrently and defeating the point of this test.
+    const distinctNames = [
+      'Groceries', 'Coffee Shops', 'Electronics', 'Travel', 'Pet Supplies', 'Insurance',
+      'Gym Membership', 'Streaming Services', 'Car Maintenance', 'Home Improvement',
+      'Medical Expenses', 'Baby Supplies', 'Gardening', 'Photography Gear', 'Gaming',
+      'Beauty Products', 'Office Supplies', 'Parking Fees', 'Delivery Fees', 'Wine',
+    ];
+    const entries = distinctNames.map((name, i) => ({
+      name, groupName: 'Bills', transactionIds: [`t${i}`],
+    }));
+    actualApiService.setTransactions(entries.map((e) => transaction(e.transactionIds[0])));
+
+    const txs = entries.map((e) => transaction(e.transactionIds[0]));
+    await categorySuggester.suggest(suggestions(entries), txs, groups);
+
+    expect(peak).toBeGreaterThan(1); // actually ran concurrently, not sequentially
+    expect(peak).toBeLessThanOrEqual(5); // but bounded, not unbounded (R8)
+  });
+
+  test('updates many transactions for one category with bounded, not unbounded, concurrency', async () => {
+    const groups = [{
+      id: 'g1',
+      name: 'Bills',
+      categories: [{
+        id: 'c1', name: 'Utilities', group_id: 'g1', is_income: false,
+      }],
+    }];
+    actualApiService.setCategoryGroups(groups);
+    const transactionIds = Array.from({ length: 20 }, (_, i) => `t${i}`);
+    actualApiService.setTransactions(transactionIds.map(transaction));
+    let active = 0;
+    let peak = 0;
+    jest.spyOn(actualApiService, 'updateTransactionNotesAndCategory').mockImplementation(async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => { setTimeout(resolve, 5); });
+      active -= 1;
+    });
+
+    await categorySuggester.suggest(
+      suggestions([{ name: 'Utilities', groupName: 'Bills', transactionIds }]),
+      transactionIds.map(transaction),
+      groups,
+    );
+
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(5);
+  });
 });

@@ -89,6 +89,9 @@ export default class LlmService implements LlmServiceI {
     if (requestsLimit !== undefined) {
       this.rateLimiter.setProviderLimit(this.provider, requestsLimit);
     }
+    if (tokensLimit !== undefined) {
+      this.rateLimiter.setProviderTokenLimit(this.provider, tokensLimit);
+    }
     const fmt = (n: number | undefined): string => {
       if (n === undefined) return 'unset';
       if (n === 0) return 'disabled';
@@ -124,6 +127,11 @@ export default class LlmService implements LlmServiceI {
       metrics.incr('llm_requests');
       metrics.incr('llm_prompt_chars_total', prompt.length);
       const requestStart = Date.now();
+      // Rough estimate (chars/4) used only to proactively throttle before the call;
+      // reconciled against the SDK's real usage.totalTokens right after, when the
+      // provider reports one, so the rate limiter's sliding window doesn't drift
+      // from an estimate over many requests.
+      let actualTokens: number | undefined;
 
       const result = await this.rateLimiter.executeWithRateLimiting(this.provider, async () => {
         const controller = new AbortController();
@@ -134,18 +142,19 @@ export default class LlmService implements LlmServiceI {
             // grammar-constrains decoding to unifiedResponseSchema (see
             // llm-model-factory's structuredOutputs: true), so this can't come back
             // malformed or empty the way free-text JSON occasionally did.
-            const { object } = await generateObject({
+            const { object, usage } = await generateObject({
               model: this.model,
               prompt: this.stripCacheBreakpoint(prompt),
               temperature: this.temperature ?? 0.2,
               schema: unifiedResponseSchema,
               abortSignal: controller.signal,
             });
+            actualTokens = usage?.totalTokens;
             return object;
           }
 
           const tools = this.supportsToolCalling() ? this.toolService?.getTools() : undefined;
-          const { text } = await generateText({
+          const { text, usage } = await generateText({
             model: this.model,
             ...this.buildPromptInput(prompt),
             temperature: this.temperature ?? 0.2,
@@ -153,6 +162,7 @@ export default class LlmService implements LlmServiceI {
             maxSteps: tools ? 3 : 1,
             abortSignal: controller.signal,
           });
+          actualTokens = usage?.totalTokens;
 
           // Only wrap parsing/validation errors; transport/provider errors must bubble up so the
           // RateLimiter can apply provider-specific backoff/retry behavior.
@@ -160,7 +170,10 @@ export default class LlmService implements LlmServiceI {
         } finally {
           clearTimeout(timer);
         }
-      });
+      }, undefined, { estimatedTokens: Math.ceil(prompt.length / 4) });
+      if (actualTokens !== undefined) {
+        this.rateLimiter.recordActualTokenUsage(this.provider, actualTokens);
+      }
       metrics.addMs('llm_request_ms_total', Date.now() - requestStart);
       return result;
     } catch (error) {

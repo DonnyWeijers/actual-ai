@@ -30,6 +30,12 @@ class NewCategoryStrategy implements ProcessingStrategyI {
     metrics.incr('category_suggestions_raw');
     const categoryKey = `${response.newCategory.groupName}:${response.newCategory.name}`;
 
+    // Safe to run concurrently (Phase 3, LLM_CONCURRENCY > 1) without a lock: this
+    // get-then-set/push has no `await` anywhere in it, so JS never interleaves
+    // another call between the read and the write — the only place execution could
+    // hand off to another concurrent transaction is at an `await`, and there isn't
+    // one here. See tests/new-category-strategy.test.ts for a concurrency regression
+    // test pinning this.
     const existing = suggestedCategories.get(categoryKey);
     if (existing) {
       existing.transactions.push(transaction);

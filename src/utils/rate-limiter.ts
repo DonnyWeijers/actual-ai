@@ -18,12 +18,41 @@ interface TokenBucket {
   resetTimestamp: number;
 }
 
-class RateLimiter {
-  private requestCounts = new Map<string, number>();
+interface TokenUsageEntry {
+  time: number;
+  tokens: number;
+}
 
-  private lastRequestTime = new Map<string, number>();
+interface ExecuteOptions {
+  /** Estimated outgoing prompt tokens for this call (e.g. chars/4). Only needed if a
+   * tokens-per-minute limit is set for this provider; omit otherwise. */
+  estimatedTokens?: number;
+}
+
+const WINDOW_MS = 60_000;
+
+class RateLimiter {
+  // Sliding windows: every entry is a real timestamp, pruned to the trailing 60s on
+  // each check. Replaces the old requestCounts/lastRequestTime pair, whose "reset if
+  // more than a minute since the LAST request" logic meant the window's effective
+  // start kept sliding forward on every single call — at 80% of the limit it could
+  // wait close to a full 60s measured from the most recent call, not from when the
+  // window actually opened.
+  private requestTimestamps = new Map<string, number[]>();
+
+  private tokenUsageWindow = new Map<string, TokenUsageEntry[]>();
+
+  // Best-effort pointer to the most recently registered token-usage estimate for a
+  // provider, so a caller can reconcile it against real SDK usage once known (see
+  // recordActualTokenUsage). Under concurrency this may not be the exact entry a
+  // given call registered if several overlap — acceptable: this only feeds a
+  // proactive sliding-window estimate, not a billing record, and staying close to
+  // real usage over time is what matters, not perfect per-call attribution.
+  private lastTokenEntry = new Map<string, TokenUsageEntry>();
 
   private maxRequestsPerMinute = new Map<string, number>();
+
+  private maxTokensPerMinute = new Map<string, number>();
 
   private tokenBuckets = new Map<string, TokenBucket>();
 
@@ -37,8 +66,27 @@ class RateLimiter {
     this.maxRequestsPerMinute.set(provider, limit);
   }
 
+  /** 0 or unset both mean "no token-based throttling for this provider" — same
+   * unset/0/positive trichotomy as setProviderLimit, resolved by the caller
+   * (LlmService) before this is ever called. */
+  public setProviderTokenLimit(provider: string, limit: number): void {
+    this.maxTokensPerMinute.set(provider, limit);
+  }
+
   public enableDebug(): void {
     this.debugMode = true;
+  }
+
+  /** Call once the real SDK response is in, if it reports usage — replaces this
+   * call's chars/4 estimate with the real token count so the sliding window stays
+   * accurate over time instead of drifting from a rough estimate. Safe to skip: if
+   * there's nothing to reconcile (no token limit configured, or the entry already
+   * aged out of the window), this is a no-op. */
+  public recordActualTokenUsage(provider: string, actualTokens: number): void {
+    const entry = this.lastTokenEntry.get(provider);
+    if (entry) {
+      entry.tokens = actualTokens;
+    }
   }
 
   public async executeWithRateLimiting<T>(
@@ -50,6 +98,7 @@ class RateLimiter {
       maxDelayMs: 60000,
       jitter: true,
     },
+    options: ExecuteOptions = {},
   ): Promise<T> {
     let attempt = 0;
     let lastError: Error | null = null;
@@ -60,11 +109,7 @@ class RateLimiter {
           console.log(`Retry attempt ${attempt}/${retryParams.maxRetries} for ${provider}...`);
         }
 
-        // Wait before proceeding if we need to
-        await this.waitIfNeeded(provider);
-
-        // Track this request
-        this.trackRequest(provider);
+        await this.reserveCapacity(provider, options.estimatedTokens ?? 0);
 
         return await operation();
       } catch (error) {
@@ -118,7 +163,7 @@ class RateLimiter {
       provider,
       errorInfo,
       tokenBucket: bucket ?? 'No token data available',
-      requestsInLastMinute: this.requestCounts.get(provider) ?? 0,
+      requestsInLastMinute: (this.requestTimestamps.get(provider) ?? []).length,
       maxRequestsPerMinute: this.maxRequestsPerMinute.get(provider) ?? 'No limit set',
     };
   }
@@ -225,49 +270,95 @@ class RateLimiter {
     return Math.floor(delay);
   }
 
-  private trackRequest(provider: string): void {
-    const now = Date.now();
-    const count = this.requestCounts.get(provider) ?? 0;
-    const lastTime = this.lastRequestTime.get(provider) ?? 0;
-
-    // Reset counter if more than a minute has passed
-    if (now - lastTime > 60000) {
-      this.requestCounts.set(provider, 1);
-    } else {
-      this.requestCounts.set(provider, count + 1);
+  private pruneWindow(provider: string, now: number): void {
+    const cutoff = now - WINDOW_MS;
+    const reqs = this.requestTimestamps.get(provider);
+    if (reqs) {
+      const kept = reqs.filter((t) => t > cutoff);
+      this.requestTimestamps.set(provider, kept);
     }
-
-    this.lastRequestTime.set(provider, now);
+    const toks = this.tokenUsageWindow.get(provider);
+    if (toks) {
+      const kept = toks.filter((entry) => entry.time > cutoff);
+      this.tokenUsageWindow.set(provider, kept);
+    }
   }
 
-  private async waitIfNeeded(provider: string): Promise<void> {
-    const limit = this.maxRequestsPerMinute.get(provider) ?? 0;
-    const count = this.requestCounts.get(provider) ?? 0;
-    const lastTime = this.lastRequestTime.get(provider) ?? 0;
-    const now = Date.now();
-    let waitTime = 0;
+  private computeRequestWaitMs(provider: string, now: number): number {
+    const limit = this.maxRequestsPerMinute.get(provider);
+    if (!limit) {
+      return 0;
+    }
+    const reqs = this.requestTimestamps.get(provider) ?? [];
+    if (reqs.length < limit) {
+      return 0;
+    }
+    // Pruned above, so index 0 is the oldest timestamp still inside the window —
+    // once IT ages out, there's room again.
+    return reqs[0] + WINDOW_MS - now + 100;
+  }
 
-    // Check token bucket first - this has priority
+  private computeTokenWaitMs(provider: string, now: number, estimatedTokens: number): number {
+    const limit = this.maxTokensPerMinute.get(provider);
+    if (!limit) {
+      return 0;
+    }
+    const toks = this.tokenUsageWindow.get(provider) ?? [];
+    const used = toks.reduce((sum, entry) => sum + entry.tokens, 0);
+    if (used + estimatedTokens <= limit || toks.length === 0) {
+      // Either there's room, or a single request already exceeds the whole budget —
+      // in the latter case there's nothing to usefully wait for, so let it through
+      // rather than waiting forever on a window that can never satisfy it alone.
+      return 0;
+    }
+    return toks[0].time + WINDOW_MS - now + 100;
+  }
+
+  /**
+   * Claims a request slot (and, if a token limit is configured, a token-budget slot)
+   * for `provider`. Single-shot, like the pre-Phase-3 code: compute how long to
+   * wait, wait once if needed, then register the claim and proceed — no retry loop.
+   * A loop that re-checks after sleeping sounds more correct, but it isn't free:
+   * under a mocked/frozen clock (real in tests, and possible in practice if a
+   * system clock stalls) a sleep that resolves without time actually advancing
+   * would spin forever recomputing the same positive wait. One wait, then proceed,
+   * can't do that — and in exchange for that safety it can occasionally admit a
+   * request into the current second slightly early. That's an acceptable trade for
+   * this project's actual use (a single local Ollama instance, low concurrency).
+   */
+  private async reserveCapacity(provider: string, estimatedTokens: number): Promise<void> {
+    const now = Date.now();
+    this.pruneWindow(provider, now);
+
+    // Token bucket (reactive, learned from a provider's 429 error body) takes
+    // priority over the proactive sliding-window estimate below.
     const bucket = this.tokenBuckets.get(provider);
-    if (bucket && bucket.resetTimestamp > now) {
-      // If we're close to the limit and reset time is in the future
-      if (bucket.remaining < bucket.limit * 0.10) {
-        waitTime = bucket.resetTimestamp - now + 1000; // add 1 second buffer
-        console.log(`Waiting ${waitTime}ms for token bucket to reset for ${provider}`);
-        await this.sleep(waitTime);
-        return;
+    if (bucket && bucket.resetTimestamp > now && bucket.remaining < bucket.limit * 0.1) {
+      const wait = bucket.resetTimestamp - now + 1000;
+      console.log(`Waiting ${wait}ms for token bucket to reset for ${provider}`);
+      await this.sleep(wait);
+    } else {
+      const wait = Math.max(
+        this.computeRequestWaitMs(provider, now),
+        this.computeTokenWaitMs(provider, now, estimatedTokens),
+      );
+      if (wait > 0) {
+        console.log(`Preemptively waiting ${wait}ms to avoid rate limit for ${provider}`);
+        await this.sleep(wait);
       }
     }
 
-    // If we have a request limit set and we're approaching it
-    if (limit && count >= limit * 0.8) {
-      // If less than a minute has passed since the first request in this window
-      if (now - lastTime < 60000) {
-        // Calculate time remaining until the minute is up
-        waitTime = 60000 - (now - lastTime) + 100; // add 100ms buffer
-        console.log(`Preemptively waiting ${waitTime}ms to avoid rate limit for ${provider}`);
-        await this.sleep(waitTime);
-      }
+    const claimTime = Date.now();
+    const reqs = this.requestTimestamps.get(provider) ?? [];
+    reqs.push(claimTime);
+    this.requestTimestamps.set(provider, reqs);
+
+    if (this.maxTokensPerMinute.get(provider)) {
+      const toks = this.tokenUsageWindow.get(provider) ?? [];
+      const entry: TokenUsageEntry = { time: claimTime, tokens: estimatedTokens };
+      toks.push(entry);
+      this.tokenUsageWindow.set(provider, toks);
+      this.lastTokenEntry.set(provider, entry);
     }
   }
 

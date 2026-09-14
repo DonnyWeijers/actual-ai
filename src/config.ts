@@ -32,6 +32,17 @@ export const openrouterEnableToolCalling = process.env.OPENROUTER_ENABLE_TOOL_CA
 // (prompt -> messages), and a custom PROMPT_TEMPLATE without {{cacheBreakpoint}} gets
 // no benefit from it anyway.
 export const llmPromptCacheEnabled = process.env.LLM_PROMPT_CACHE === 'true';
+// How many transactions to classify at once. Default 1 preserves the exact previous
+// behavior (strictly sequential, with the fixed inter-batch pause) until a user opts
+// in. When raised above 1, BatchTransactionProcessor drops that fixed pause entirely
+// — throttling then becomes the rate limiter's job, not a blind sleep's. Guidance:
+// 4-8 for hosted providers (OpenAI/Anthropic/Gemini/Groq/OpenRouter); 1-2 for a local
+// Ollama instance, since one CPU/GPU rarely benefits from more inflight requests than
+// that and a too-high value just makes several requests fight over the same compute.
+const parsedLlmConcurrency = Number.parseInt(process.env.LLM_CONCURRENCY ?? '', 10);
+export const llmConcurrency = Number.isFinite(parsedLlmConcurrency) && parsedLlmConcurrency > 0
+  ? parsedLlmConcurrency
+  : 1;
 // Some models reject an explicit temperature (GPT-5 accepts the default of 1 only), so allow
 // overriding it. Unset keeps the previous hardcoded values.
 const parsedLlmTemperature = Number.parseFloat(process.env.LLM_TEMPERATURE ?? '');

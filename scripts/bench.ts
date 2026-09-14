@@ -249,7 +249,7 @@ class FakeLlmService implements LlmServiceI {
   }
 }
 
-async function runDataset(dataset: Dataset, llmLatencyMs: number): Promise<void> {
+async function runDataset(dataset: Dataset, llmLatencyMs: number, concurrency: number): Promise<void> {
   metrics.reset();
 
   // Not dry run: this is a fully in-memory fake, so "writes" only mutate a local
@@ -289,7 +289,12 @@ async function runDataset(dataset: Dataset, llmLatencyMs: number): Promise<void>
     [ruleMatchStrategy, existingCategoryStrategy, newCategoryStrategy],
     payeeCategoryCache,
   );
-  const batchTransactionProcessor = new BatchTransactionProcessor(transactionProcessor, 20, payeeCategoryCache);
+  const batchTransactionProcessor = new BatchTransactionProcessor(
+    transactionProcessor,
+    20,
+    payeeCategoryCache,
+    concurrency,
+  );
   const transactionFilterer = new TransactionFilterer(tagService);
   const categorySuggester = new CategorySuggester(
     api,
@@ -311,7 +316,7 @@ async function runDataset(dataset: Dataset, llmLatencyMs: number): Promise<void>
   const snap = metrics.snapshot();
   console.log(`\n=== Dataset ${dataset.name} ===`);
   console.log(`transactions=${dataset.transactions.length} distinct_merchants=${dataset.payees.length}`);
-  console.log(`wall_clock_ms=${wallMs} (includes real fixed inter-batch sleeps + ${llmLatencyMs}ms/call synthetic LLM latency)`);
+  console.log(`wall_clock_ms=${wallMs} (concurrency=${concurrency}, ${llmLatencyMs}ms/call synthetic LLM latency${concurrency <= 1 ? ', includes the fixed inter-batch sleep' : ', no fixed sleep'})`);
   console.log(`llm_requests=${snap.llm_requests} llm_cache_hits=${snap.llm_cache_hits} transactions_processed=${snap.transactions_processed}`);
   console.log(`llm_prompt_chars_total=${snap.llm_prompt_chars_total} (avg ${snap.llm_requests > 0 ? Math.round(snap.llm_prompt_chars_total / snap.llm_requests) : 0} chars/request)`);
   console.log(`actual_read_calls=${snap.actual_read_calls}`);
@@ -328,6 +333,8 @@ async function main(): Promise<void> {
   // per-call cost.
   const latencyArg = process.argv.find((a) => a.startsWith('--latency='));
   const llmLatencyMs = latencyArg ? Number(latencyArg.split('=')[1]) : 0;
+  const concurrencyArg = process.argv.find((a) => a.startsWith('--concurrency='));
+  const concurrency = concurrencyArg ? Number(concurrencyArg.split('=')[1]) : 1;
 
   const datasets = [
     buildDataset('A', 100, 50, 10, 1),
@@ -335,11 +342,11 @@ async function main(): Promise<void> {
     buildDataset('C', 1000, 60, 100, 3), // high duplicate rate: 1000 tx over 60 merchants
   ];
 
-  console.log(`Benchmark harness — synthetic LLM latency: ${llmLatencyMs}ms/call`);
+  console.log(`Benchmark harness — synthetic LLM latency: ${llmLatencyMs}ms/call, concurrency=${concurrency}`);
   // eslint-disable-next-line no-restricted-syntax
   for (const dataset of datasets) {
     // eslint-disable-next-line no-await-in-loop
-    await runDataset(dataset, llmLatencyMs);
+    await runDataset(dataset, llmLatencyMs, concurrency);
   }
 }
 

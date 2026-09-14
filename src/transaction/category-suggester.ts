@@ -4,6 +4,14 @@ import { APICategoryEntity, APICategoryGroupEntity } from '../types';
 import CategorySuggestionOptimizer from '../category-suggestion-optimizer';
 import TagService from './tag-service';
 import metrics from '../utils/metrics';
+import mapWithConcurrency from '../utils/concurrency';
+
+// Bounds how many category-creation / transaction-update writes to Actual run at
+// once (R8: this used to be a fully unbounded Promise.all over every category and,
+// nested inside that, every one of its transactions). Not user-configurable: unlike
+// LLM_CONCURRENCY, there's no real per-provider tradeoff here to expose, just a cap
+// against hammering Actual's API.
+const WRITE_CONCURRENCY = 5;
 
 class CategorySuggester {
   private readonly actualApiService: ActualApiServiceI;
@@ -111,9 +119,16 @@ class CategorySuggester {
       return pending;
     };
 
-    // Use optimized categories instead of original suggestions
-    await Promise.all(
-      Array.from(optimizedCategories.entries()).map(async ([_key, suggestion]) => {
+    // Bounded, not unbounded (R8). Group resolution above stays sequential — that's
+    // the race fix and does not change — but categories within already-resolved
+    // groups are independent of each other, so creating/resolving them up to
+    // WRITE_CONCURRENCY at a time is safe. A category's own transaction updates
+    // depend on that category's id existing first, so they're bounded separately,
+    // nested inside its own creation.
+    await mapWithConcurrency(
+      Array.from(optimizedCategories.values()),
+      WRITE_CONCURRENCY,
+      async (suggestion) => {
         try {
           const groupId = groupIdByName.get(suggestion.groupName);
           if (!groupId) {
@@ -122,21 +137,22 @@ class CategorySuggester {
 
           const categoryId = await resolveCategoryId(groupId, suggestion.name);
 
-          // Use Promise.all with map for nested async operations
-          await Promise.all(
-            suggestion.transactions.map(async (transaction) => {
+          await mapWithConcurrency(
+            suggestion.transactions,
+            WRITE_CONCURRENCY,
+            async (transaction) => {
               await this.actualApiService.updateTransactionNotesAndCategory(
                 transaction.id,
                 this.tagService.addGuessedTag(transaction.notes ?? ''),
                 categoryId,
               );
               console.log(`Assigned transaction ${transaction.id} to category ${suggestion.name}`);
-            }),
+            },
           );
         } catch (error) {
           console.error(`Error assigning category ${suggestion.name}:`, error);
         }
-      }),
+      },
     );
   }
 

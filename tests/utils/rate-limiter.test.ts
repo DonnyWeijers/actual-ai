@@ -35,24 +35,28 @@ describe('RateLimiter', () => {
       expect(operation).toHaveBeenCalledTimes(9);
     });
 
-    it('should enforce rate limits when approaching the limit', async () => {
-      // Set a low provider limit
+    it('does not wait until the sliding window is actually full', async () => {
       rateLimiter.setProviderLimit('test-provider', 5);
-
       const operation = jest.fn().mockResolvedValue('success');
 
-      // Execute operations up to 80% of the limit
-      for (let i = 0; i < 4; i++) {
+      for (let i = 0; i < 5; i++) {
         await rateLimiter.executeWithRateLimiting('test-provider', operation);
       }
 
-      expect(operation).toHaveBeenCalledTimes(4);
+      expect(operation).toHaveBeenCalledTimes(5);
+      expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('Preemptively waiting'));
+    });
 
-      // Next operation should trigger preemptive waiting
+    it('waits once the sliding window is full', async () => {
+      rateLimiter.setProviderLimit('test-provider', 5);
+      const operation = jest.fn().mockResolvedValue('success');
+
+      for (let i = 0; i < 5; i++) {
+        await rateLimiter.executeWithRateLimiting('test-provider', operation);
+      }
       await rateLimiter.executeWithRateLimiting('test-provider', operation);
 
-      // Verify the sleep was called with correct delay
-      // This implicitly tests waitIfNeeded when count >= limit * 0.8
+      expect(operation).toHaveBeenCalledTimes(6);
       expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Preemptively waiting'));
     });
   });
@@ -244,6 +248,62 @@ describe('RateLimiter', () => {
 
       // Should have logged waiting for token bucket
       expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Waiting') && expect.stringContaining('for token bucket to reset for groq'));
+    });
+  });
+
+  describe('tokens-per-minute throttling', () => {
+    it('does not throttle when no token limit is configured', async () => {
+      const operation = jest.fn().mockResolvedValue('success');
+      await rateLimiter.executeWithRateLimiting('test-provider', operation, undefined, {
+        estimatedTokens: 999_999,
+      });
+      expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('Preemptively waiting'));
+    });
+
+    it('throttles once the estimated tokens for this call would exceed the per-minute budget', async () => {
+      rateLimiter.setProviderTokenLimit('test-provider', 1000);
+      const operation = jest.fn().mockResolvedValue('success');
+
+      await rateLimiter.executeWithRateLimiting('test-provider', operation, undefined, { estimatedTokens: 600 });
+      expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('Preemptively waiting'));
+
+      await rateLimiter.executeWithRateLimiting('test-provider', operation, undefined, { estimatedTokens: 600 });
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Preemptively waiting'));
+    });
+
+    it('a single request exceeding the whole budget is let through rather than waited on forever', async () => {
+      rateLimiter.setProviderTokenLimit('test-provider', 100);
+      const operation = jest.fn().mockResolvedValue('success');
+
+      await rateLimiter.executeWithRateLimiting('test-provider', operation, undefined, { estimatedTokens: 5000 });
+      expect(operation).toHaveBeenCalledTimes(1);
+    });
+
+    it('recordActualTokenUsage reconciles the estimate so the window reflects real usage', async () => {
+      rateLimiter.setProviderTokenLimit('test-provider', 1000);
+      const operation = jest.fn().mockResolvedValue('success');
+
+      // Estimate 600, but the real usage turns out to be tiny — reconciling should
+      // free up budget for the next call that a stale 600-token estimate would not.
+      await rateLimiter.executeWithRateLimiting('test-provider', operation, undefined, { estimatedTokens: 600 });
+      rateLimiter.recordActualTokenUsage('test-provider', 10);
+
+      await rateLimiter.executeWithRateLimiting('test-provider', operation, undefined, { estimatedTokens: 600 });
+      expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('Preemptively waiting'));
+    });
+  });
+
+  describe('concurrent callers', () => {
+    it('proactively throttles once concurrent calls fill the request window, and every call still completes', async () => {
+      rateLimiter.setProviderLimit('test-provider', 3);
+      const operation = jest.fn().mockResolvedValue('success');
+
+      await Promise.all(
+        Array.from({ length: 5 }, () => rateLimiter.executeWithRateLimiting('test-provider', operation)),
+      );
+
+      expect(operation).toHaveBeenCalledTimes(5);
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Preemptively waiting'));
     });
   });
 

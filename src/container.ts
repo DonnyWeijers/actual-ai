@@ -23,6 +23,7 @@ import {
   llmTimeoutMs,
   llmTemperature,
   llmPromptCacheEnabled,
+  llmConcurrency,
   notGuessedTag,
   ollamaBaseURL,
   ollamaModel,
@@ -152,6 +153,7 @@ const batchTransactionProcessor = new BatchTransactionProcessor(
   transactionProcessor,
   20,
   payeeCategoryCache,
+  llmConcurrency,
 );
 
 const transactionFilterer = new TransactionFilterer(tagService);

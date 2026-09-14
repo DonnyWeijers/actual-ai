@@ -505,3 +505,175 @@ resolved-payee case.
 - Did not attempt to strip city names in `normalizeMerchantText` — no gazetteer, and a
   wrong guess risks eating a real word out of a short merchant name. Documented as a
   deliberate limit, not silently accepted.
+
+# Phase 3: safe concurrency (P2)
+
+Note on sequencing: this landed before Phase 2 (category planning quality), which was
+skipped by mistake. Not a deliberate reordering — flagged and corrected after the
+fact; Phase 2 follows this section.
+
+## 3.1 Bounded pool
+
+`src/utils/concurrency.ts`: `mapWithConcurrency<T, R>(items, limit, fn)`. Pull-based
+(each worker claims the next unclaimed index the moment it's free, not "wait for the
+whole batch") so one slow item never stalls workers that could be picking up later
+ones — this is the actual difference from the old `batch.reduce(...)` shape, which
+serialized everything regardless. Returns `PromiseSettledResult<R>[]`
+(`Promise.allSettled`'s own shape): one item's rejection doesn't stop the others, and
+callers get an explicit per-item outcome instead of the whole call throwing. No new
+dependency, ~40 lines.
+
+Verified: 6 tests (`tests/concurrency.test.ts`) — peak concurrency never exceeds the
+limit but does reach it, order-preserving results regardless of completion order,
+rejection isolation, a slow item not blocking faster ones behind it, empty input,
+limit larger than the item count.
+
+## 3.2 Classification concurrency
+
+New `LLM_CONCURRENCY` env var (`src/config.ts`), **default 1**. `BatchTransactionProcessor`
+now has two explicit paths:
+
+- `concurrency <= 1`: byte-for-byte the old sequential loop — batches of 20, the
+  fixed 2000ms pause between them. Nothing changes for a user who never touches this
+  setting.
+- `concurrency > 1`: routes every transaction in the run through `mapWithConcurrency`
+  at that limit, no fixed pause — throttling is the rate limiter's job now (3.4), not
+  a blind sleep's.
+
+Verified the one genuinely shared piece of mutable state under concurrency —
+`NewCategoryStrategy`'s `suggestedCategories.get()`-then-`.push()`/`.set()` — is safe
+without a lock: there's no `await` anywhere between the read and the write, and JS
+only ever hands off to another concurrent call at an `await`. Documented in the
+method itself, and pinned with 2 concurrency-specific tests
+(`tests/new-category-strategy.test.ts`, 50 and 40 concurrent calls respectively —
+no lost or cross-attributed transactions). 3 more tests
+(`tests/batch-transaction-processor.test.ts`) cover both paths directly: concurrency=1
+stays sequential with the pause, concurrency>1 is bounded and pause-free, and one
+transaction's error doesn't stop the batch.
+
+## 3.3 Bounded category creation
+
+Replaced both `Promise.all`s in `CategorySuggester.suggest()` (R8: previously fully
+unbounded — every category and, nested inside each, every one of its transactions)
+with `mapWithConcurrency` at a fixed `WRITE_CONCURRENCY = 5`. Not user-configurable —
+unlike `LLM_CONCURRENCY` there's no real per-provider tradeoff to expose here, just a
+cap against hammering Actual's API. Group resolution stays exactly as sequential as
+before (unchanged) — that's the race fix from the earlier production bug and Phase 3
+does not touch it; stated explicitly in a comment at the call site so the reasoning
+doesn't have to be re-derived later.
+
+Verified with 2 new tests asserting peak concurrent `createCategory`/
+`updateTransactionNotesAndCategory` calls: greater than 1 (so it's genuinely
+concurrent, not accidentally still serial) and at most 5 (so it's bounded, not
+unbounded).
+
+## 3.4 Fix the rate limiter
+
+Both R10 bugs, fixed:
+
+- **Window bug**: replaced `requestCounts`/`lastRequestTime` (reset "if more than a
+  minute since the *last* request" — which kept sliding the window's effective start
+  forward on every call) with real sliding windows of timestamps
+  (`requestTimestamps`, `tokenUsageWindow`), pruned to the trailing 60s on each check.
+- **Dead token axis**: `tokensPerMinute` is now actually enforced. `LlmService.ask()`
+  estimates outgoing tokens as `chars/4`, passes that through
+  `executeWithRateLimiting`'s new optional `estimatedTokens` option, and — when the
+  provider reports real `usage.totalTokens` — reconciles the estimate via
+  `recordActualTokenUsage()` so the window doesn't drift from a rough guess over many
+  requests.
+
+**A real bug found and fixed during this sub-item, not in the original R-list**:
+the first implementation used a `for(;;)` retry loop (compute wait → sleep → recheck)
+that reads more "obviously correct" than a single wait-then-proceed — but it hung the
+test suite (`jest.useFakeTimers()` mocks `sleep` to resolve without advancing
+`Date.now()`, so the loop recomputed the same positive wait forever and ran the
+process out of memory). Simplified to the single-shot version documented in the
+method's own docstring: this project's actual concurrency (a single local Ollama
+instance, `LLM_CONCURRENCY` of 1–2) doesn't need a perfectly tight retry loop, and the
+simpler version can't hang under a stalled/mocked clock. Noting this because it's
+exactly the kind of thing "looks more correct" that turned out to be the wrong
+tradeoff for this project — the retry-loop version was reverted, not layered around.
+
+Existing env-var trichotomy preserved (unset → provider default, 0 → axis disabled,
+positive → custom) — unchanged in `LlmService`, which already resolved it correctly;
+this phase only had to make `RateLimiter` actually consume the token side of it via a
+new `setProviderTokenLimit()`.
+
+`executeWithRateLimiting()`'s signature is unchanged and back-compat — the new
+`estimatedTokens` option is an optional 4th parameter, so all 15 pre-existing tests in
+`tests/utils/rate-limiter.test.ts` kept working (one was updated, not because its
+mechanism broke, but because it was pinning the *old bug's* 80%-early-warning
+behavior — see below). 5 new tests cover token throttling, `recordActualTokenUsage`
+reconciliation, a single request that alone exceeds the whole budget (let through
+rather than waited on forever), and — the task's explicit ask — proactive throttling
+under real concurrent callers (`Promise.all`, not sequential awaits).
+
+**One existing test changed, deliberately**: `should enforce rate limits when
+approaching the limit` asserted that hitting 80% of the request limit (4 out of 5)
+triggered preemptive waiting *before* the 5th request. That was the old code
+faithfully doing what it was designed to do; it just also happened to be the specific
+behavior built on top of the buggy window logic being fixed here. Replaced with two
+tests pinning the corrected semantics: no wait until the window is actually full, wait
+once it is.
+
+## 3.5 Web search in-flight sharing
+
+`ToolService.webSearchCache` now stores the in-flight `Promise<string>` itself
+(`CachedSearchEntry.promise`), not the resolved value — three concurrent lookups of
+the same merchant (only actually possible now that 3.2 allows real concurrency) share
+one HTTP request instead of each firing its own. A rejected promise is evicted from
+the cache immediately (`.catch()` deletes the key before rethrowing) so a transient
+failure doesn't leave a permanently-failing entry for the TTL — the next lookup gets a
+fresh attempt. TTL and the 200-entry cap are unchanged.
+
+Verified: 2 new tests in `tests/tool-service-cache.test.ts` (concurrent identical
+queries → one `performSearch` call; a rejection is evicted and retried, not cached) on
+top of the 3 pre-existing cache tests, which all still pass unchanged.
+
+## Measured: the concurrency mechanism is real, not just modeled
+
+Earlier in this project I was asked what wall-clock improvement to expect from Phase
+3, before writing any of it, and declined to give a number — the honest answer at the
+time was "I don't know, it depends on real per-call latency and the concurrency you
+choose." Now that the mechanism exists, here's a real comparison: same 3 datasets,
+same 200ms/call *synthetic* latency (not real Ollama latency, which is far higher and
+was already measured elsewhere in this project to be 58–95s/call on CPU-only
+hardware — 200ms is chosen only to keep this benchmark run fast, not to represent
+real-world Ollama), `concurrency=1` vs `concurrency=4`:
+
+| Dataset | concurrency=1 | concurrency=4 | Speedup |
+|---|---|---|---|
+| A | 14,092ms | 1,835ms | 7.7x |
+| B | 71,648ms | 6,267ms | 11.4x |
+| C | 110,285ms | 3,466ms | 31.8x |
+
+`llm_requests`/`llm_cache_hits` are identical between the two runs on each dataset
+(caching is orthogonal to concurrency) — the entire difference is the fixed sleep
+being gone and real parallelism replacing sequential waiting. Reproduce with
+`npm run bench -- --latency=<ms> --concurrency=<n>`.
+
+**What this table does not tell you**: your actual speedup with real Ollama. Per the
+earlier discussion in this project, the sleep's fixed cost matters most relative to
+how *cheap* each real call already is — a hosted API (1–3s/call) looks like the table
+above; local Ollama, where a single call can be 100–500x more expensive than this
+table's 200ms and concurrency is capped low (1–2, one CPU/GPU rarely benefits from
+more), sees a smaller relative win because the sleep was never the dominant cost to
+begin with. The formula is `ceil(llm_requests / concurrency) × real_call_latency`;
+plug in real Ollama numbers once you've picked a concurrency to try.
+
+## What I deliberately did not do, and why
+
+- Did not make `WRITE_CONCURRENCY` (category creation) user-configurable — no real
+  per-provider tradeoff exists for it the way there is for `LLM_CONCURRENCY`; it's
+  purely a "don't hammer Actual's API" cap.
+- Did not attempt perfect per-request token-usage attribution in
+  `recordActualTokenUsage` — under heavy concurrency it may reconcile a slightly
+  different in-flight entry than the one that actually produced the usage number.
+  Documented as an accepted imprecision: this feeds a proactive sliding-window
+  estimate, not a billing record, and staying roughly accurate over time is what
+  matters.
+- Did not add a retry-loop / re-check-after-waiting version of `reserveCapacity` back
+  in after simplifying it — the single-shot version is correct for this project's
+  actual concurrency levels and can't hang; a tighter loop would be solving a problem
+  (perfect enforcement at high concurrency against a real external API) this project
+  doesn't have.

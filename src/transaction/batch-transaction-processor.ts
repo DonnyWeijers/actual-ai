@@ -8,6 +8,7 @@ import {
 } from '../types';
 import TransactionProcessor from './transaction-processor';
 import PayeeCategoryCache from './payee-category-cache';
+import mapWithConcurrency from '../utils/concurrency';
 
 class BatchTransactionProcessor {
   private readonly transactionProcessor: TransactionProcessor;
@@ -16,14 +17,18 @@ class BatchTransactionProcessor {
 
   private readonly payeeCategoryCache: PayeeCategoryCache;
 
+  private readonly concurrency: number;
+
   constructor(
     transactionProcessor: TransactionProcessor,
     batchSize: number,
     payeeCategoryCache: PayeeCategoryCache,
+    concurrency = 1,
   ) {
     this.transactionProcessor = transactionProcessor;
     this.batchSize = batchSize;
     this.payeeCategoryCache = payeeCategoryCache;
+    this.concurrency = concurrency;
   }
 
   public async process(
@@ -50,6 +55,34 @@ class BatchTransactionProcessor {
     // .find() over `categories` per transaction.
     const categoryById = new Map(categories.map((category) => [category.id, category]));
 
+    if (this.concurrency <= 1) {
+      await this.processSequentially(uncategorizedTransactions, promptContext, categoryById, suggestedCategories);
+    } else {
+      await this.processConcurrently(uncategorizedTransactions, promptContext, categoryById, suggestedCategories);
+    }
+
+    this.payeeCategoryCache.logSummary();
+  }
+
+  /**
+   * LLM_CONCURRENCY <= 1 (the default): unchanged from before Phase 3, byte-for-byte
+   * — strictly sequential, batches of `batchSize`, with the fixed 2s pause between
+   * batches. Kept as its own path rather than routed through the concurrency pool
+   * with limit=1, specifically so a user who never touches LLM_CONCURRENCY sees zero
+   * behavior change.
+   */
+  private async processSequentially(
+    uncategorizedTransactions: TransactionEntity[],
+    promptContext: ReturnType<TransactionProcessor['createPromptContext']>,
+    categoryById: Map<string, APICategoryEntity | APICategoryGroupEntity>,
+    suggestedCategories: Map<string, {
+        name: string;
+        groupName: string;
+        groupIsNew: boolean;
+        groupId?: string;
+        transactions: TransactionEntity[];
+      }>,
+  ): Promise<void> {
     for (
       let batchStart = 0;
       batchStart < uncategorizedTransactions.length;
@@ -83,8 +116,46 @@ class BatchTransactionProcessor {
         });
       }
     }
+  }
 
-    this.payeeCategoryCache.logSummary();
+  /**
+   * LLM_CONCURRENCY > 1: up to that many transactions in flight at once, no fixed
+   * pause — throttling is the rate limiter's job now (see RateLimiter), not a blind
+   * sleep's. TransactionProcessor.process() already catches and logs its own errors
+   * internally and never rethrows, so a 'rejected' entry here would mean something
+   * escaped that — worth surfacing loudly rather than silently dropping.
+   */
+  private async processConcurrently(
+    uncategorizedTransactions: TransactionEntity[],
+    promptContext: ReturnType<TransactionProcessor['createPromptContext']>,
+    categoryById: Map<string, APICategoryEntity | APICategoryGroupEntity>,
+    suggestedCategories: Map<string, {
+        name: string;
+        groupName: string;
+        groupIsNew: boolean;
+        groupId?: string;
+        transactions: TransactionEntity[];
+      }>,
+  ): Promise<void> {
+    const results = await mapWithConcurrency(
+      uncategorizedTransactions,
+      this.concurrency,
+      async (transaction, index) => {
+        console.log(
+          `${index + 1}/${uncategorizedTransactions.length} Processing transaction '${transaction.imported_payee}'`,
+        );
+        await this.transactionProcessor.process(transaction, promptContext, categoryById, suggestedCategories);
+      },
+    );
+
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        console.error(
+          `Unexpected error processing transaction ${uncategorizedTransactions[index].id}:`,
+          result.reason,
+        );
+      }
+    });
   }
 }
 

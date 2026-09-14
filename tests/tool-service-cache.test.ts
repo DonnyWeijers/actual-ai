@@ -77,4 +77,41 @@ describe('ToolService caching', () => {
 
     expect(searchSpy).toHaveBeenCalledTimes(202);
   });
+
+  test('concurrent lookups of the same query share one in-flight request', async () => {
+    const { execute, searchSpy } = await setUpWebSearch();
+
+    const results = await Promise.all([
+      execute({ query: 'Example' }, { toolCallId: 't1', messages: [] } as never),
+      execute({ query: 'Example' }, { toolCallId: 't2', messages: [] } as never),
+      execute({ query: 'Example' }, { toolCallId: 't3', messages: [] } as never),
+    ]);
+
+    expect(searchSpy).toHaveBeenCalledTimes(1);
+    results.forEach((r) => expect(r).toContain('[Source 1] T'));
+  });
+
+  test('a rejected search is evicted rather than cached — the next lookup retries', async () => {
+    process.env.FEATURES = '["webSearch"]';
+    const ToolService = (await import('../src/utils/tool-service')).default;
+    const searchSpy = jest.spyOn(
+      ToolService.prototype as unknown as { performSearch: (query: string) => Promise<unknown> },
+      'performSearch',
+    )
+      .mockRejectedValueOnce(new Error('network error'))
+      .mockResolvedValueOnce({ organic_results: [{ title: 'T', snippet: 'S', link: 'L' }] });
+
+    const webSearchTool = new ToolService('value-serp-key').getTools().webSearch;
+    if (!webSearchTool?.execute) {
+      throw new Error('webSearch tool is unavailable');
+    }
+    const execute = webSearchTool.execute.bind(webSearchTool) as unknown as ToolExecute;
+
+    await expect(execute({ query: 'Example' }, { toolCallId: 't1', messages: [] } as never))
+      .rejects.toThrow('network error');
+    await expect(execute({ query: 'Example' }, { toolCallId: 't2', messages: [] } as never))
+      .resolves.toContain('[Source 1] T');
+
+    expect(searchSpy).toHaveBeenCalledTimes(2);
+  });
 });

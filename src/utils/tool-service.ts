@@ -15,8 +15,12 @@ interface OrganicResults {
   organic_results?: SearchResult[];
 }
 
-interface CachedSearchResult {
-  value: string;
+interface CachedSearchEntry {
+  // The in-flight (or already-settled) request itself, not its resolved value —
+  // three concurrent lookups of the same merchant (now genuinely possible once
+  // Phase 3's LLM_CONCURRENCY > 1 is in use) share this one Promise/one HTTP
+  // request instead of each firing their own.
+  promise: Promise<string>;
   expiresAt: number;
 }
 
@@ -27,7 +31,7 @@ export default class ToolService implements ToolServiceI {
 
   private readonly valueSerpApiKey: string;
 
-  private readonly webSearchCache = new Map<string, CachedSearchResult>();
+  private readonly webSearchCache = new Map<string, CachedSearchEntry>();
 
   constructor(valueSerpApiKey: string) {
     this.valueSerpApiKey = valueSerpApiKey;
@@ -93,23 +97,23 @@ export default class ToolService implements ToolServiceI {
     return query.trim();
   }
 
-  private getCachedResult(
-    cache: Map<string, CachedSearchResult>,
+  private getCachedEntry(
+    cache: Map<string, CachedSearchEntry>,
     cacheKey: string,
-  ): string | undefined {
+  ): Promise<string> | undefined {
     const cached = cache.get(cacheKey);
     if (!cached) return undefined;
     if (cached.expiresAt <= Date.now()) {
       cache.delete(cacheKey);
       return undefined;
     }
-    return cached.value;
+    return cached.promise;
   }
 
-  private setCachedResult(
-    cache: Map<string, CachedSearchResult>,
+  private setCachedEntry(
+    cache: Map<string, CachedSearchEntry>,
     cacheKey: string,
-    value: string,
+    promise: Promise<string>,
   ): void {
     this.pruneExpiredEntries(cache);
     if (cache.size >= ToolService.CACHE_MAX_ENTRIES) {
@@ -119,12 +123,12 @@ export default class ToolService implements ToolServiceI {
       }
     }
     cache.set(cacheKey, {
-      value,
+      promise,
       expiresAt: Date.now() + ToolService.CACHE_TTL_MS,
     });
   }
 
-  private pruneExpiredEntries(cache: Map<string, CachedSearchResult>): void {
+  private pruneExpiredEntries(cache: Map<string, CachedSearchEntry>): void {
     const now = Date.now();
     for (const [key, entry] of cache.entries()) {
       if (entry.expiresAt <= now) {
@@ -141,7 +145,7 @@ export default class ToolService implements ToolServiceI {
     executor,
   }: {
     query: string;
-    cache: Map<string, CachedSearchResult>;
+    cache: Map<string, CachedSearchEntry>;
     unavailableMessage: string;
     searchTypeLabel: string;
     executor: (normalizedQuery: string) => Promise<string>;
@@ -150,15 +154,22 @@ export default class ToolService implements ToolServiceI {
     if (!normalizedQuery) return unavailableMessage;
     metrics.incr('web_search_requests');
     const cacheKey = normalizedQuery.toLowerCase();
-    const cached = this.getCachedResult(cache, cacheKey);
+    const cached = this.getCachedEntry(cache, cacheKey);
     if (cached) {
       metrics.incr('web_search_cache_hits');
       return cached;
     }
     console.log(`Performing ${searchTypeLabel} for ${normalizedQuery}`);
-    const result = await executor(normalizedQuery);
-    this.setCachedResult(cache, cacheKey, result);
-    return result;
+    // Cache the in-flight promise itself, not its eventual value, so concurrent
+    // lookups for the same query share this one request. A rejection is evicted
+    // immediately rather than cached, so the next lookup gets a fresh attempt
+    // instead of a permanently failing cache entry.
+    const promise = executor(normalizedQuery).catch((error: unknown) => {
+      cache.delete(cacheKey);
+      throw error;
+    });
+    this.setCachedEntry(cache, cacheKey, promise);
+    return promise;
   }
 
   private async performSearch(query: string): Promise<OrganicResults> {
