@@ -25,6 +25,13 @@ export const llmTimeoutMs = Number.isFinite(parsedLlmTimeoutMs) && parsedLlmTime
   ? parsedLlmTimeoutMs
   : 120_000;
 export const openrouterEnableToolCalling = process.env.OPENROUTER_ENABLE_TOOL_CALLING === 'true';
+// Anthropic-only: marks the run-invariant part of the prompt (everything before
+// {{cacheBreakpoint}} in prompt.hbs) as a cache breakpoint via providerOptions, so
+// repeated requests within Anthropic's cache TTL skip reprocessing the shared
+// categories/rules/schema block. Off by default: it changes the request shape
+// (prompt -> messages), and a custom PROMPT_TEMPLATE without {{cacheBreakpoint}} gets
+// no benefit from it anyway.
+export const llmPromptCacheEnabled = process.env.LLM_PROMPT_CACHE === 'true';
 // Some models reject an explicit temperature (GPT-5 accepts the default of 1 only), so allow
 // overriding it. Unset keeps the previous hardcoded values.
 const parsedLlmTemperature = Number.parseFloat(process.env.LLM_TEMPERATURE ?? '');
@@ -130,6 +137,16 @@ function registerStandardFeatures() {
     enabled: enabledFeatures.includes('disableRateLimiter'),
     defaultValue: false,
     description: 'Disable Rate Limiter',
+  };
+
+  features.dedupeUnresolvedPayees = {
+    enabled: enabledFeatures.includes('dedupeUnresolvedPayees'),
+    defaultValue: false,
+    description: 'Extend the per-run LLM response cache to transactions with no '
+      + 'resolved Actual payee, keyed on a normalized imported_payee + notes + sign '
+      + '(payee-id-based caching stays on unconditionally either way). Off by default '
+      + 'because the normalization is heuristic and can, in principle, merge two '
+      + 'genuinely different merchants that happen to normalize the same way.',
   };
 }
 

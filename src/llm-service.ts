@@ -1,4 +1,6 @@
-import { generateObject, generateText, LanguageModel } from 'ai';
+import {
+  generateObject, generateText, CoreMessage, LanguageModel,
+} from 'ai';
 import { z } from 'zod';
 import {
   LlmModelFactoryI, LlmServiceI, ToolServiceI, UnifiedResponse,
@@ -7,6 +9,7 @@ import RateLimiter from './utils/rate-limiter';
 import { PROVIDER_LIMITS } from './utils/provider-limits';
 import { parseLlmResponse } from './utils/json-utils';
 import metrics from './utils/metrics';
+import { CACHE_BREAKPOINT_MARKER } from './handlebars-helpers';
 
 // Mirrors UnifiedResponse. Used only for the Ollama provider's structured-output
 // path (see ask()), where Ollama grammar-constrains decoding to this exact shape
@@ -37,6 +40,8 @@ export default class LlmService implements LlmServiceI {
 
   private readonly temperature: number | undefined;
 
+  private readonly promptCacheEnabled: boolean;
+
   constructor(
     llmModelFactory: LlmModelFactoryI,
     rateLimiter: RateLimiter,
@@ -48,6 +53,7 @@ export default class LlmService implements LlmServiceI {
       temperature?: number;
       requestsPerMinuteOverride?: number | null;
       tokensPerMinuteOverride?: number | null;
+      promptCacheEnabled?: boolean;
     },
   ) {
     const factory = llmModelFactory;
@@ -58,6 +64,7 @@ export default class LlmService implements LlmServiceI {
     this.timeoutMs = options?.timeoutMs ?? 120_000;
     this.openrouterEnableToolCalling = options?.openrouterEnableToolCalling ?? false;
     this.temperature = options?.temperature;
+    this.promptCacheEnabled = options?.promptCacheEnabled ?? false;
 
     // Resolve effective rate limits per axis with trichotomy:
     //   override === null      → fall back to provider default
@@ -129,7 +136,7 @@ export default class LlmService implements LlmServiceI {
             // malformed or empty the way free-text JSON occasionally did.
             const { object } = await generateObject({
               model: this.model,
-              prompt,
+              prompt: this.stripCacheBreakpoint(prompt),
               temperature: this.temperature ?? 0.2,
               schema: unifiedResponseSchema,
               abortSignal: controller.signal,
@@ -140,7 +147,7 @@ export default class LlmService implements LlmServiceI {
           const tools = this.supportsToolCalling() ? this.toolService?.getTools() : undefined;
           const { text } = await generateText({
             model: this.model,
-            prompt,
+            ...this.buildPromptInput(prompt),
             temperature: this.temperature ?? 0.2,
             tools,
             maxSteps: tools ? 3 : 1,
@@ -161,6 +168,48 @@ export default class LlmService implements LlmServiceI {
       console.error(`Error during LLM request to ${this.provider}: ${errorMsg}`);
       throw error;
     }
+  }
+
+  private stripCacheBreakpoint(prompt: string): string {
+    return prompt.split(CACHE_BREAKPOINT_MARKER).join('');
+  }
+
+  /**
+   * Returns either `{ prompt }` (the normal flat string, breakpoint marker stripped —
+   * every provider except Anthropic-with-caching-enabled, and the default state) or
+   * `{ messages }` with an explicit Anthropic cache breakpoint on the run-invariant
+   * prefix (LLM_PROMPT_CACHE=true and the provider is Anthropic). Spread directly into
+   * the generateText() call.
+   */
+  private buildPromptInput(
+    prompt: string,
+  ): { prompt: string } | { messages: CoreMessage[] } {
+    if (!this.promptCacheEnabled || this.provider !== 'anthropic') {
+      return { prompt: this.stripCacheBreakpoint(prompt) };
+    }
+
+    const parts = prompt.split(CACHE_BREAKPOINT_MARKER);
+    if (parts.length < 2) {
+      // Custom PROMPT_TEMPLATE without {{cacheBreakpoint}} — nothing to split on,
+      // fall back to the flat prompt exactly as if caching were off.
+      return { prompt };
+    }
+
+    const [prefix, ...rest] = parts;
+    const suffix = rest.join('');
+    return {
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: prefix,
+            providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } },
+          },
+          { type: 'text', text: suffix },
+        ],
+      }],
+    };
   }
 
   /**

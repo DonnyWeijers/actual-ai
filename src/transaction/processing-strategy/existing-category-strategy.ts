@@ -1,6 +1,6 @@
-import type { CategoryEntity, TransactionEntity } from '@actual-app/core/src/types/models';
+import type { TransactionEntity } from '@actual-app/core/src/types/models';
 import type {
-  ActualApiServiceI, ProcessingStrategyI, UnifiedResponse,
+  ActualApiServiceI, APICategoryEntity, APICategoryGroupEntity, ProcessingStrategyI, UnifiedResponse,
 } from '../../types';
 import TagService from '../tag-service';
 
@@ -28,12 +28,12 @@ class ExistingCategoryStrategy implements ProcessingStrategyI {
   public async process(
     transaction: TransactionEntity,
     response: UnifiedResponse,
-    categories: CategoryEntity[],
+    categoryById: Map<string, APICategoryEntity | APICategoryGroupEntity>,
   ) {
     if (response.categoryId === undefined) {
       throw new Error('No categoryId in response');
     }
-    const category = categories.find((c) => c.id === response.categoryId);
+    const category = categoryById.get(response.categoryId);
     if (!category) {
       // Add not guessed tag when category not found
       await this.actualApiService.updateTransactionNotes(

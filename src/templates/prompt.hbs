@@ -1,19 +1,4 @@
-I want to categorize the given bank transaction.
-
-Transaction details:
-* Amount: {{amount}}
-* Type: {{type}}
-{{#if description}}
-* Description: {{description}}
-{{/if}}
-{{#if payee}}
-* Payee: {{payee}}
-{{^}}
-* Payee: {{importedPayee}}
-{{/if}}
-{{#if date}}
-* Date: {{date}}
-{{/if}}
+I want to categorize a bank transaction.
 
 Existing categories by group:
 {{#each categoryGroups}}
@@ -55,4 +40,21 @@ Examples:
 
 {{#if hasWebSearchTool}}
 You can use the web search tool to find more information about the transaction.
+{{/if}}
+{{cacheBreakpoint}}
+Now categorize the following transaction:
+
+Transaction details:
+* Amount: {{amount}}
+* Type: {{type}}
+{{#if description}}
+* Description: {{description}}
+{{/if}}
+{{#if payee}}
+* Payee: {{payee}}
+{{^}}
+* Payee: {{importedPayee}}
+{{/if}}
+{{#if date}}
+* Date: {{date}}
 {{/if}}

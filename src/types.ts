@@ -104,7 +104,33 @@ export interface ToolServiceI {
   search?(query: string): Promise<string>;
 }
 
+// Precomputed, run-invariant prompt inputs (see PromptGenerator.createRunContext).
+// Built once per run and reused for every transaction, instead of recompiling the
+// template and rebuilding groupsWithCategories/rulesDescription/the payee index on
+// every single transaction.
+export interface PromptRunContext {
+  template: (data: Record<string, unknown>) => string;
+  groupsWithCategories: (APICategoryGroupEntity & {
+    groupName: string;
+    categories: APICategoryEntity[];
+  })[];
+  rulesDescription: RuleDescription[];
+  payeeNameById: Map<string, string>;
+  hasWebSearchTool: boolean;
+}
+
 export interface PromptGeneratorI {
+  createRunContext(
+    categoryGroups: APICategoryGroupEntity[],
+    payees: APIPayeeEntity[],
+    rules: RuleEntity[],
+  ): PromptRunContext;
+
+  generateFromContext(
+    context: PromptRunContext,
+    transaction: TransactionEntity,
+  ): string;
+
   generate(
     categoryGroups: APICategoryGroupEntity[],
     transaction: TransactionEntity,
@@ -123,7 +149,10 @@ export interface ProcessingStrategyI {
   process(
       transaction: TransactionEntity,
       response: UnifiedResponse,
-      categories: (APICategoryEntity | APICategoryGroupEntity)[],
+      // Indexed once per run (see BatchTransactionProcessor), not the raw array — the
+      // only strategy that reads this (ExistingCategoryStrategy) does an O(1)
+      // .get(categoryId) instead of a linear .find() on every transaction.
+      categoryById: Map<string, APICategoryEntity | APICategoryGroupEntity>,
       suggestedCategories: Map<string, {
         name: string;
         groupName: string;

@@ -12,6 +12,12 @@ class CategorySuggester {
 
   private readonly tagService: TagService;
 
+  // Memoized per `suggest()` call (see findCategoryId): a hidden-category collision
+  // refetches the full category list once, and every later collision in the same run
+  // reuses that same result instead of each triggering its own full refetch. Reset at
+  // the top of suggest() so results don't leak between runs.
+  private categoriesPromise: Promise<(APICategoryEntity | APICategoryGroupEntity)[]> | undefined;
+
   constructor(
     actualApiService: ActualApiServiceI,
     categorySuggestionOptimizer: CategorySuggestionOptimizer,
@@ -33,6 +39,8 @@ class CategorySuggester {
     uncategorizedTransactions: TransactionEntity[],
     categoryGroups: APICategoryGroupEntity[],
   ): Promise<void> {
+    this.categoriesPromise = undefined;
+
     metrics.incr(
       'existing_category_count',
       categoryGroups.reduce((sum, group) => sum + (group.categories?.length ?? 0), 0),
@@ -52,12 +60,13 @@ class CategorySuggester {
     const uniqueGroupNames = Array.from(new Set(
       Array.from(optimizedCategories.values()).map((s) => s.groupName),
     ));
+    const categoryGroupByNormalizedName = new Map(
+      categoryGroups.map((group) => [group.name.toLowerCase(), group]),
+    );
     const groupIdByName = new Map<string, string>();
     // eslint-disable-next-line no-restricted-syntax
     for (const groupName of uniqueGroupNames) {
-      const existing = categoryGroups.find(
-        (g) => g.name.toLowerCase() === groupName.toLowerCase(),
-      );
+      const existing = categoryGroupByNormalizedName.get(groupName.toLowerCase());
       if (existing) {
         metrics.incr('existing_group_count');
         groupIdByName.set(groupName, existing.id);
@@ -149,7 +158,8 @@ class CategorySuggester {
   }
 
   private async findCategoryId(name: string, groupId: string): Promise<string | undefined> {
-    const categories = await this.actualApiService.getCategories();
+    this.categoriesPromise ??= this.actualApiService.getCategories();
+    const categories = await this.categoriesPromise;
     const match = categories.find((category) => {
       const { group_id: categoryGroupId } = category as APICategoryEntity & { group_id?: string };
       return categoryGroupId === groupId

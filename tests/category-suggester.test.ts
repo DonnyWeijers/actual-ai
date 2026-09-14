@@ -109,4 +109,62 @@ describe('CategorySuggester', () => {
     const [updated] = await actualApiService.getTransactions();
     expect(updated.category).toBe('hidden-1');
   });
+
+  test('refetches categories at most once per suggest() call, even with multiple hidden-category collisions', async () => {
+    const groups = [{ id: 'g1', name: 'Bills', categories: [] }];
+    actualApiService.setCategoryGroups(groups);
+    actualApiService.setCategories([
+      {
+        id: 'hidden-1', name: 'Utilities', group_id: 'g1', is_income: false,
+      },
+      {
+        id: 'hidden-2', name: 'Rent', group_id: 'g1', is_income: false,
+      },
+    ]);
+    jest.spyOn(actualApiService, 'createCategory').mockRejectedValue(
+      new Error('already exists'),
+    );
+    const getCategories = jest.spyOn(actualApiService, 'getCategories');
+
+    await categorySuggester.suggest(
+      suggestions([
+        { name: 'Utilities', groupName: 'Bills', transactionIds: ['t1'] },
+        { name: 'Rent', groupName: 'Bills', transactionIds: ['t2'] },
+      ]),
+      [transaction('t1'), transaction('t2')],
+      groups,
+    );
+
+    expect(getCategories).toHaveBeenCalledTimes(1);
+    const [t1, t2] = await actualApiService.getTransactions();
+    expect(t1.category).toBe('hidden-1');
+    expect(t2.category).toBe('hidden-2');
+  });
+
+  test('a second, separate suggest() call refetches categories again — the memo does not leak across runs', async () => {
+    const groups = [{ id: 'g1', name: 'Bills', categories: [] }];
+    actualApiService.setCategoryGroups(groups);
+    actualApiService.setCategories([
+      {
+        id: 'hidden-1', name: 'Utilities', group_id: 'g1', is_income: false,
+      },
+    ]);
+    jest.spyOn(actualApiService, 'createCategory').mockRejectedValue(
+      new Error('already exists'),
+    );
+    const getCategories = jest.spyOn(actualApiService, 'getCategories');
+
+    await categorySuggester.suggest(
+      suggestions([{ name: 'Utilities', groupName: 'Bills', transactionIds: ['t1'] }]),
+      [transaction('t1')],
+      groups,
+    );
+    await categorySuggester.suggest(
+      suggestions([{ name: 'Utilities', groupName: 'Bills', transactionIds: ['t2'] }]),
+      [transaction('t2')],
+      groups,
+    );
+
+    expect(getCategories).toHaveBeenCalledTimes(2);
+  });
 });

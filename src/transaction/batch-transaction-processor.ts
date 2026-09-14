@@ -40,6 +40,16 @@ class BatchTransactionProcessor {
         transactions: TransactionEntity[];
       }>,
   ): Promise<void> {
+    // Built once for the whole run, not once per transaction: compiling the template
+    // and rebuilding groupsWithCategories/rulesDescription/the payee index is the
+    // same work every time since categoryGroups/payees/rules don't change mid-run
+    // (see PromptGenerator.createRunContext's docstring for why that's safe).
+    const promptContext = this.transactionProcessor.createPromptContext(categoryGroups, payees, rules);
+    // Same reasoning: ExistingCategoryStrategy looks up a category by id on every
+    // transaction with an "existing" response — index once instead of a linear
+    // .find() over `categories` per transaction.
+    const categoryById = new Map(categories.map((category) => [category.id, category]));
+
     for (
       let batchStart = 0;
       batchStart < uncategorizedTransactions.length;
@@ -59,10 +69,8 @@ class BatchTransactionProcessor {
 
         await this.transactionProcessor.process(
           transaction,
-          categoryGroups,
-          payees,
-          rules,
-          categories,
+          promptContext,
+          categoryById,
           suggestedCategories,
         );
       }, Promise.resolve());

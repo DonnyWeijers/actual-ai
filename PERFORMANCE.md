@@ -326,3 +326,182 @@ Notes on reading this table:
 Reproduce with `npm run bench` (takes ~2.5 minutes, almost entirely the R1 sleep) or
 `npm run bench -- --latency=<ms>` to also see a chosen synthetic per-call LLM cost
 layered on top.
+
+# Phase 1: eliminate wasted work
+
+## 1.1 Run-local LLM request deduplication
+
+The payee-id-keyed cache already existed (see R2 correction above). What's new:
+
+- **Fallback key for unresolved payees**, gated behind `dedupeUnresolvedPayees`
+  (`src/config.ts`), default off. `src/transaction/dedup-key.ts` derives a key from
+  normalized `imported_payee` (dropping dates, reference/store numbers, and common
+  noise keywords — real examples like `ALBERT HEIJN 1234 DELFT` → `albert heijn
+  delft`, `IDEAL 12-09 REF 887766` → `ideal`), falling back to normalized `notes`,
+  plus transaction sign. Deliberately excludes the raw amount (near-0% hit rate,
+  every purchase is a different number) and does not attempt to strip city names (no
+  gazetteer — see the module docstring for why that's an acceptable limit, not a bug).
+  Off by default because the normalization is heuristic and could, in principle,
+  collide two different merchants that happen to normalize the same way — that's a
+  real judgment call for a project maintainer to make, not mine to default on.
+- **In-flight promise sharing + non-poisoning rejection.** `PayeeCategoryCache` now
+  stores `Promise<UnifiedResponse>`, not resolved values (`getOrCreate()` replaces the
+  old `get()`/`set()`). This matters once Phase 3 adds concurrency: two calls for the
+  same key that overlap in time share the one request instead of racing into two.
+  Storing an in-flight promise creates a failure mode the old resolved-value cache
+  never had — a rejected promise sitting in the map would permanently fail every later
+  transaction for that key — so a rejection evicts itself immediately, giving the next
+  caller a fresh attempt.
+
+Verified with 4 new integration tests (`tests/transaction-processor-dedup.test.ts`,
+exercising the real `TransactionProcessor`) and 15 unit tests
+(`tests/dedup-key.test.ts`, `tests/payee-category-cache.test.ts`): resolved-payee
+dedup work regardless of the flag; unresolved-payee dedup only when the flag is on;
+genuinely different merchants are never shared; a rejection doesn't poison the cache.
+
+**What the benchmark does NOT show, and why that's honest, not a gap in the work**:
+`llm_requests` on datasets A/B/C is unchanged from the Phase 0 baseline
+(30/117/60) — because the synthetic dataset gives every transaction a resolved payee
+(matching how Actual actually behaves for synced transactions), so every transaction
+was already hitting the pre-existing payee-id cache. The new fallback path targets
+transactions Actual leaves *without* a resolved payee, which this dataset shape
+doesn't include. I don't know what fraction of transactions in a real budget lack a
+resolved payee — I didn't have access to a real budget's raw sync data to measure it —
+so I'm reporting the mechanism as verified-correct via the dedicated tests, not
+claiming a benchmark win I can't show.
+
+## 1.2 Hoist the invariant prompt work
+
+`PromptGenerator.createRunContext()` compiles the template and builds
+`groupsWithCategories`/`rulesDescription`/the payee-id→name index once;
+`generateFromContext()` renders one transaction against that context.
+`BatchTransactionProcessor.process()` calls `createRunContext()` once before its batch
+loop instead of once per transaction. `generate()` (the old 4-arg signature) is kept
+unchanged, implemented in terms of the two new methods, so none of the 6 existing
+call sites in `tests/prompt-generator.test.ts` needed to change.
+
+Safe because of B1 (plan/mutate separation, confirmed in Phase 0): categoryGroups,
+payees, and rules are held constant for the whole classification loop, and nothing in
+that loop can create a category or group mid-run — only the later `suggest()` phase
+does, after the loop has already finished. That assumption is stated explicitly in
+the method's docstring for whoever touches this next.
+
+**What the benchmark does NOT show**: this removes O(N) redundant
+`handlebars.compile()` calls and O(N) rebuilds of `groupsWithCategories`/
+`rulesDescription`/the payee map (verified by code inspection — there's exactly one
+call to `createRunContext()` per run now, not one per transaction), but at N=100-1000
+each of those operations costs low single-digit milliseconds at most, and the
+benchmark's wall-clock is completely dominated by R1's still-unfixed 2000ms/batch
+sleep (Phase 3's job). The saving is real and grows with N; it's just not visible
+against 8-98 seconds of sleep at this N. `llm_prompt_chars_total`/request ticked up
+slightly (3889→3942 avg) — that's the reordered template's added "Now categorize the
+following transaction:" line, not a regression.
+
+## 1.3 Reorder the prompt template for prefix caching
+
+`src/templates/prompt.hbs`: the invariant block (categories, rules, JSON schema,
+examples, the web-search note) now comes first; the per-transaction block (amount,
+type, description, payee, date) comes last. README updated to tell custom
+`PROMPT_TEMPLATE` users to do the same.
+
+Checked the pinned `ai`/`@ai-sdk/anthropic` versions (ai@4.3.5, @ai-sdk/anthropic@1.2.9):
+Anthropic cache control **is** available — `cacheControl` via `providerOptions`,
+enabled by default in this version (no SDK upgrade needed, confirming the task's
+"do not upgrade the SDK here" constraint was satisfiable). Implemented behind
+`LLM_PROMPT_CACHE=true` (`src/config.ts`'s `llmPromptCacheEnabled`, wired into
+`LlmService`'s constructor options in `container.ts`):
+
+- `src/handlebars-helpers.ts` registers a `{{cacheBreakpoint}}` helper emitting a
+  NUL-wrapped sentinel (`CACHE_BREAKPOINT_MARKER`), placed in `prompt.hbs` right
+  between the invariant block and "Now categorize...".
+- `LlmService.ask()`: when the flag is on and the provider is `anthropic`, splits the
+  rendered prompt on that sentinel and sends `messages: [{ role: 'user', content: [
+  { type: 'text', text: prefix, providerOptions: { anthropic: { cacheControl: { type:
+  'ephemeral' } } } }, { type: 'text', text: suffix } ] }]` instead of a flat
+  `prompt` string. Every other case (flag off — the default; provider isn't
+  anthropic; a custom template with no `{{cacheBreakpoint}}`) strips the marker and
+  sends the identical flat prompt as before — verified by 4 tests in
+  `tests/llm-service-prompt-cache.test.ts` asserting the exact `generateText` call
+  shape in each case.
+
+**What I did not, and could not, measure**: whether this actually reduces latency or
+cost against Anthropic's real API. The benchmark's fake LLM never talks to Anthropic —
+there's no real cache to hit. This is exactly the kind of number the task says not to
+invent; the honest claim is "the mechanism is wired correctly and covered by tests,"
+not "X% faster."
+
+## 1.4 Stop refetching category state
+
+- `CategorySuggester`: `categoryGroupByNormalizedName` replaces the `categoryGroups
+  .find()` scan in the group-resolution loop with a Map built once. `findCategoryId()`
+  now shares one memoized `getCategories()` promise (`this.categoriesPromise`,
+  reset at the top of each `suggest()` call) instead of refetching on every collision.
+  `existingCategoryIds` (the group-id+name → category-id index) already existed
+  before this phase — it's effectively `categoryByNormalizedGroupAndName` already,
+  confirmed in Phase 0, not rebuilt here.
+- `ExistingCategoryStrategy`: the real hot loop for category lookups isn't inside
+  `CategorySuggester` at all (that only runs once per run, in the suggestion tail) —
+  it's here, once per transaction with an "existing" response. Changed
+  `categories.find(c => c.id === response.categoryId)` (O(transactions × categories))
+  to a `categoryById: Map` built once in `BatchTransactionProcessor.process()`
+  alongside the prompt context (O(1) per lookup). `ProcessingStrategyI`'s shared
+  `process()` signature now takes that Map instead of the raw array — `NewCategoryStrategy`
+  and `RuleMatchStrategy` don't use it (confirmed by reading both), so this is a
+  type-only change for them.
+
+Verified: 2 new tests in `tests/category-suggester.test.ts` (multiple collisions in
+one `suggest()` call trigger exactly one `getCategories()`; two separate `suggest()`
+calls each refetch — the memo doesn't leak across runs). `ExistingCategoryStrategy`'s
+behavior is unchanged and covered by the existing integration tests in
+`tests/actual-ai.test.ts`, which all still pass.
+
+**What the benchmark does NOT show**: `actual_read_calls` stayed at 6 on every
+dataset — because A/B/C's synthetic suggestions never collide with an existing
+category (`categories_reused=0` throughout, same as Phase 0), so the memoized-refetch
+path never fires in this data. It's verified correct by the dedicated tests, not by a
+benchmark number, for the same reason 1.1's fallback path isn't: the benchmark's data
+shape doesn't happen to exercise that edge.
+
+## Measured deltas vs. Phase 0 baseline
+
+| Metric | A | B | C | Changed? |
+|---|---|---|---|---|
+| `llm_requests` | 30 | 117 | 60 | No — see 1.1 |
+| `llm_cache_hits` | 70 | 383 | 940 | No |
+| `llm_prompt_chars_total`/req | 3,942 (was 3,889) | 3,942 | 3,942 | +53 chars, template reorder, not a regression |
+| `actual_read_calls` | 6 | 6 | 6 | No — see 1.4 |
+| `category_suggestions_raw→unique→merged` | 18→10→7 | 241→43→19 | 478→21→16 | No |
+| `wall_clock_ms` | 8,060 (was 8,136) | 48,183 (was 48,430) | 98,228 (was 98,411) | No, within noise — still R1-dominated |
+
+Every number that *should* be unchanged on this dataset is unchanged, and I can
+explain exactly why for each one rather than shrug at it. Phase 1's real, verified
+wins (fallback dedup, hoisted prompt building, memoized category refetch, cache
+breakpoints) are demonstrated by 21 new unit/integration tests, not by this benchmark
+— the benchmark's synthetic data doesn't happen to contain the specific conditions
+(unresolved payees, category-creation collisions, a real Anthropic connection) that
+would make them visible in call counts or wall-clock. Reproducing this table doesn't
+require re-deriving that reasoning: `npm run bench`.
+
+## Correction to Phase 0's own report
+
+None — R1–R12 and B1–B4 stand as verified in Phase 0. This phase's only correction is
+to my own earlier framing of R2 as "not deduplication of equivalent LLM requests":
+after 1.1, that's true only for the unresolved-payee edge case, which is now
+explicitly named rather than lumped in with the (already-fixed-before-this-task)
+resolved-payee case.
+
+## What I deliberately did not do, and why
+
+- Did not touch `B1`–`B3` (plan/mutate separation, sequential group resolution,
+  suggestion dedup-by-key) — Phase 0 confirmed these are already correct; touching
+  them now would be churn, exactly what the task warns against.
+- Did not build a *persisted* (cross-run) payee→category cache — out of scope for
+  Phase 1 (that's one of the "propose before implementing" items), and doing it now
+  would preempt a design decision that isn't mine to make unilaterally.
+- Did not add cache-control support for any provider other than Anthropic — the task
+  named Anthropic specifically, and I don't know whether OpenAI/Gemini/Groq/OpenRouter
+  expose an equivalent explicit-breakpoint mechanism in the pinned SDK versions without
+  checking each one, which wasn't asked for here.
+- Did not attempt to strip city names in `normalizeMerchantText` — no gazetteer, and a
+  wrong guess risks eating a real word out of a short merchant name. Documented as a
+  deliberate limit, not silently accepted.

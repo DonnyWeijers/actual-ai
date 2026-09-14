@@ -22,6 +22,7 @@ import {
   llmProvider,
   llmTimeoutMs,
   llmTemperature,
+  llmPromptCacheEnabled,
   notGuessedTag,
   ollamaBaseURL,
   ollamaModel,
@@ -116,6 +117,7 @@ const llmService = new LlmService(
     temperature: llmTemperature,
     requestsPerMinuteOverride,
     tokensPerMinuteOverride,
+    promptCacheEnabled: llmPromptCacheEnabled,
   },
 );
 

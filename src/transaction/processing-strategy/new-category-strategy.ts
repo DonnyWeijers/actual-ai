@@ -1,6 +1,6 @@
-import { CategoryEntity, TransactionEntity } from '@actual-app/core/src/types/models';
+import { TransactionEntity } from '@actual-app/core/src/types/models';
 import type {
-  ProcessingStrategyI, UnifiedResponse,
+  APICategoryEntity, APICategoryGroupEntity, ProcessingStrategyI, UnifiedResponse,
 } from '../../types';
 import metrics from '../../utils/metrics';
 
@@ -15,7 +15,7 @@ class NewCategoryStrategy implements ProcessingStrategyI {
   public async process(
     transaction: TransactionEntity,
     response: UnifiedResponse,
-    categories: CategoryEntity[],
+    categoryById: Map<string, APICategoryEntity | APICategoryGroupEntity>,
     suggestedCategories: Map<string, {
         name: string;
         groupName: string;

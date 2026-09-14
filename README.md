@@ -162,6 +162,12 @@ To create a custom prompt, modify the `PROMPT_TEMPLATE` environment variable to 
 Ensure that the [Handlebars](https://handlebarsjs.com/) syntax is correctly used to handle conditional rendering and
 loops.
 
+**Tip for prompt caching:** the same `categoryGroups`/`rules`/schema/examples content is sent on every request within
+a run, while the transaction details (`amount`, `type`, `description`, `payee`, `date`) change on every request.
+Providers that support prompt caching key it on a shared *prefix*, so put the parts that don't change first and the
+per-transaction details last — that's how the bundled template (`src/templates/prompt.hbs`) is ordered. A custom
+template with the transaction details first won't get any caching benefit from a provider that supports it.
+
 ### Variables
 
 1. `categoryGroups`: An array of category group objects. Each category group contains an array of categories.

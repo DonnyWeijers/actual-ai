@@ -6,10 +6,12 @@ import { APIPayeeEntity } from '@actual-app/core/src/server/api-models';
 import {
   ActualApiServiceI, APICategoryEntity, APICategoryGroupEntity,
   LlmServiceI, ProcessingStrategyI,
-  PromptGeneratorI,
+  PromptGeneratorI, PromptRunContext,
 } from '../types';
 import TagService from './tag-service';
 import PayeeCategoryCache from './payee-category-cache';
+import { deriveFallbackDedupKey } from './dedup-key';
+import { isFeatureEnabled } from '../config';
 import metrics from '../utils/metrics';
 
 class TransactionProcessor {
@@ -41,12 +43,19 @@ class TransactionProcessor {
     this.payeeCategoryCache = payeeCategoryCache;
   }
 
-  public async process(
-    transaction: TransactionEntity,
+  /** Builds the run-invariant prompt context once; see PromptGenerator.createRunContext. */
+  public createPromptContext(
     categoryGroups: APICategoryGroupEntity[],
     payees: APIPayeeEntity[],
     rules: RuleEntity[],
-    categories: (APICategoryEntity | APICategoryGroupEntity)[],
+  ): PromptRunContext {
+    return this.promptGenerator.createRunContext(categoryGroups, payees, rules);
+  }
+
+  public async process(
+    transaction: TransactionEntity,
+    promptContext: PromptRunContext,
+    categoryById: Map<string, APICategoryEntity | APICategoryGroupEntity>,
     suggestedCategories: Map<string, {
         name: string;
         groupName: string;
@@ -57,29 +66,31 @@ class TransactionProcessor {
   ): Promise<void> {
     try {
       metrics.incr('transactions_processed');
-      const cachedResponse = this.payeeCategoryCache.get(transaction.payee);
-      if (cachedResponse) {
-        metrics.incr('llm_cache_hits');
-      }
-      const response = cachedResponse ?? await (async () => {
-        const prompt = this.promptGenerator.generate(
-          categoryGroups,
-          transaction,
-          payees,
-          rules,
-        );
-        const fresh = await this.llmService.ask(prompt);
-        this.payeeCategoryCache.set(transaction.payee, fresh);
-        return fresh;
-      })();
 
-      if (cachedResponse) {
-        console.log(`Using cached categorization for payee ${transaction.payee}`);
+      // Actual's own resolved payee id is always the preferred cache key — stable
+      // and accurate. Only when that's absent, and only if the caller opted in
+      // (dedupeUnresolvedPayees), fall back to a normalized-text key derived from
+      // the same fields the prompt varies on (see dedup-key.ts for why this is
+      // off by default: the normalization is heuristic).
+      const cacheKey = transaction.payee
+        ?? (isFeatureEnabled('dedupeUnresolvedPayees') ? deriveFallbackDedupKey(transaction) : undefined);
+
+      const { response, fromCache } = await this.payeeCategoryCache.getOrCreate(
+        cacheKey,
+        async () => {
+          const prompt = this.promptGenerator.generateFromContext(promptContext, transaction);
+          return this.llmService.ask(prompt);
+        },
+      );
+
+      if (fromCache) {
+        metrics.incr('llm_cache_hits');
+        console.log(`Using cached categorization for key ${cacheKey}`);
       }
 
       const strategy = this.processingStrategies.find((s) => s.isSatisfiedBy(response));
       if (strategy) {
-        await strategy.process(transaction, response, categories, suggestedCategories);
+        await strategy.process(transaction, response, categoryById, suggestedCategories);
         return;
       }
 
