@@ -16,6 +16,7 @@ import CategorySuggester from '../src/transaction/category-suggester';
 import BatchTransactionProcessor from '../src/transaction/batch-transaction-processor';
 import TransactionProcessor from '../src/transaction/transaction-processor';
 import TransactionFilterer from '../src/transaction/transaction-filterer';
+import PayeeCategoryCache from '../src/transaction/payee-category-cache';
 
 // Create a reusable mock for isFeatureEnabled
 const originalIsFeatureEnabled = config.isFeatureEnabled;
@@ -63,17 +64,21 @@ describe('ActualAiService', () => {
     const accounts = GivenActualData.createSampleAccounts();
     const rules = GivenActualData.createSampleRules();
 
+    const payeeCategoryCache = new PayeeCategoryCache();
+
     const transactionProcessor = new TransactionProcessor(
       inMemoryApiService,
       mockedLlmService,
       mockedPromptGenerator,
       tagService,
       [ruleMatchStrategy, existingCategoryStrategy, new NewCategoryStrategy()],
+      payeeCategoryCache,
     );
 
     const batchTransactionProcessor = new BatchTransactionProcessor(
       transactionProcessor,
       20,
+      payeeCategoryCache,
     );
 
     transactionService = new TransactionService(
@@ -467,14 +472,20 @@ describe('ActualAiService', () => {
         new CategorySuggestionOptimizer(new SimilarityCalculator()),
         tagService,
       );
+      const dryRunPayeeCategoryCache = new PayeeCategoryCache();
       const transactionProcessor = new TransactionProcessor(
         dryRunApiService,
         mockedLlmService,
         mockedPromptGenerator,
         tagService,
         [ruleMatchStrategy, existingCategoryStrategy, new NewCategoryStrategy()],
+        dryRunPayeeCategoryCache,
       );
-      const batchTransactionProcessor = new BatchTransactionProcessor(transactionProcessor, 20);
+      const batchTransactionProcessor = new BatchTransactionProcessor(
+        transactionProcessor,
+        20,
+        dryRunPayeeCategoryCache,
+      );
       dryRunTransactionService = new TransactionService(
         dryRunApiService,
         categorySuggester,

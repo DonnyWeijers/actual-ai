@@ -9,6 +9,7 @@ import {
   PromptGeneratorI,
 } from '../types';
 import TagService from './tag-service';
+import PayeeCategoryCache from './payee-category-cache';
 
 class TransactionProcessor {
   private readonly actualApiService: ActualApiServiceI;
@@ -21,18 +22,22 @@ class TransactionProcessor {
 
   private readonly processingStrategies: ProcessingStrategyI[];
 
+  private readonly payeeCategoryCache: PayeeCategoryCache;
+
   constructor(
     actualApiClient: ActualApiServiceI,
     llmService: LlmServiceI,
     promptGenerator: PromptGeneratorI,
     tagService: TagService,
     processingStrategies: ProcessingStrategyI[],
+    payeeCategoryCache: PayeeCategoryCache,
   ) {
     this.actualApiService = actualApiClient;
     this.llmService = llmService;
     this.promptGenerator = promptGenerator;
     this.tagService = tagService;
     this.processingStrategies = processingStrategies;
+    this.payeeCategoryCache = payeeCategoryCache;
   }
 
   public async process(
@@ -50,14 +55,22 @@ class TransactionProcessor {
       }>,
   ): Promise<void> {
     try {
-      const prompt = this.promptGenerator.generate(
-        categoryGroups,
-        transaction,
-        payees,
-        rules,
-      );
+      const cachedResponse = this.payeeCategoryCache.get(transaction.payee);
+      const response = cachedResponse ?? await (async () => {
+        const prompt = this.promptGenerator.generate(
+          categoryGroups,
+          transaction,
+          payees,
+          rules,
+        );
+        const fresh = await this.llmService.ask(prompt);
+        this.payeeCategoryCache.set(transaction.payee, fresh);
+        return fresh;
+      })();
 
-      const response = await this.llmService.ask(prompt);
+      if (cachedResponse) {
+        console.log(`Using cached categorization for payee ${transaction.payee}`);
+      }
 
       const strategy = this.processingStrategies.find((s) => s.isSatisfiedBy(response));
       if (strategy) {

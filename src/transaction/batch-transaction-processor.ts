@@ -7,18 +7,23 @@ import {
   APICategoryEntity, APICategoryGroupEntity,
 } from '../types';
 import TransactionProcessor from './transaction-processor';
+import PayeeCategoryCache from './payee-category-cache';
 
 class BatchTransactionProcessor {
   private readonly transactionProcessor: TransactionProcessor;
 
   private readonly batchSize: number;
 
+  private readonly payeeCategoryCache: PayeeCategoryCache;
+
   constructor(
     transactionProcessor: TransactionProcessor,
     batchSize: number,
+    payeeCategoryCache: PayeeCategoryCache,
   ) {
     this.transactionProcessor = transactionProcessor;
     this.batchSize = batchSize;
+    this.payeeCategoryCache = payeeCategoryCache;
   }
 
   public async process(
@@ -70,6 +75,8 @@ class BatchTransactionProcessor {
         });
       }
     }
+
+    this.payeeCategoryCache.logSummary();
   }
 }
 
