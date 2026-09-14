@@ -130,10 +130,12 @@ const existingCategoryStrategy = new ExistingCategoryStrategy(
   tagService,
 );
 
+const similarityCalculator = new SimilarityCalculator();
 const categorySuggester = new CategorySuggester(
   actualApiService,
-  new CategorySuggestionOptimizer(new SimilarityCalculator()),
+  new CategorySuggestionOptimizer(similarityCalculator),
   tagService,
+  similarityCalculator,
 );
 
 const newCategoryStrategy = new NewCategoryStrategy();

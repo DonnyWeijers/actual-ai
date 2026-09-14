@@ -7,6 +7,22 @@ describe('SimilarityCalculator', () => {
     calculator = new SimilarityCalculator();
   });
 
+  // Exact-value pin (task 2.3: "assert this with a test that pins current outputs
+  // before you touch it"). Computed from the pre-refactor implementation, so any
+  // score drift introduced by precomputing/blocking (not just a threshold crossing)
+  // fails loudly here.
+  describe('exact-value regression pin (do not change these numbers when optimizing)', () => {
+    it.each([
+      ['Sport', 'Sports', 1],
+      ['Category', 'Categories', 1],
+      ['Transport', 'Transportation', 1],
+      ['Travel', 'Travel & Transport', 0.8],
+      ['Amazon', 'Amazon.com', 0.8180000000000001],
+    ])('calculateNameSimilarity(%j, %j) === %p', (a, b, expected) => {
+      expect(calculator.calculateNameSimilarity(a, b)).toBe(expected);
+    });
+  });
+
   describe('calculateNameSimilarity', () => {
     it('should return 1.0 for identical strings', () => {
       const result = calculator.calculateNameSimilarity('Test String', 'Test String');

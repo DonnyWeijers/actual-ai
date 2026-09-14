@@ -2,6 +2,7 @@ import type { TransactionEntity } from '@actual-app/core/src/types/models';
 import type { ActualApiServiceI } from '../types';
 import { APICategoryEntity, APICategoryGroupEntity } from '../types';
 import CategorySuggestionOptimizer from '../category-suggestion-optimizer';
+import SimilarityCalculator, { NameRepresentation, dynamicSimilarityThreshold } from '../similarity-calculator';
 import TagService from './tag-service';
 import metrics from '../utils/metrics';
 import mapWithConcurrency from '../utils/concurrency';
@@ -13,10 +14,19 @@ import mapWithConcurrency from '../utils/concurrency';
 // against hammering Actual's API.
 const WRITE_CONCURRENCY = 5;
 
+interface ExistingCategoryWithRep {
+  id: string;
+  groupId: string;
+  name: string;
+  rep: NameRepresentation;
+}
+
 class CategorySuggester {
   private readonly actualApiService: ActualApiServiceI;
 
   private readonly categorySuggestionOptimizer: CategorySuggestionOptimizer;
+
+  private readonly similarityCalculator: SimilarityCalculator;
 
   private readonly tagService: TagService;
 
@@ -30,10 +40,12 @@ class CategorySuggester {
     actualApiService: ActualApiServiceI,
     categorySuggestionOptimizer: CategorySuggestionOptimizer,
     tagService: TagService,
+    similarityCalculator: SimilarityCalculator = new SimilarityCalculator(),
   ) {
     this.actualApiService = actualApiService;
     this.categorySuggestionOptimizer = categorySuggestionOptimizer;
     this.tagService = tagService;
+    this.similarityCalculator = similarityCalculator;
   }
 
   public async suggest(
@@ -99,6 +111,19 @@ class CategorySuggester {
       });
     });
 
+    // R5: an exact-name match (above) only catches "Groceries" vs "groceries" —
+    // "Grocery Shopping" next to an existing "Groceries" still slipped through as a
+    // near-duplicate. Precomputed once per existing category (2.3's spirit), reused
+    // for every suggestion's fuzzy lookup below instead of re-stemming per pair.
+    const existingCategoriesWithReps = categoryGroups.flatMap(
+      (group) => (group.categories ?? []).map((category) => ({
+        id: category.id,
+        groupId: group.id,
+        name: category.name,
+        rep: this.similarityCalculator.represent(category.name),
+      })),
+    );
+
     // Two suggestions can optimize down to the same category; share one creation between them
     // so the parallel loop below cannot race the API into the same duplicate error.
     const pendingCategoryIds = new Map<string, Promise<string>>();
@@ -109,6 +134,16 @@ class CategorySuggester {
         metrics.incr('categories_reused');
         console.log(`Reusing existing category "${name}" with ID ${existingId}`);
         return existingId;
+      }
+
+      const fuzzyMatch = this
+        .findSimilarExistingCategory(name, groupId, existingCategoriesWithReps);
+      if (fuzzyMatch) {
+        metrics.incr('categories_reused');
+        console.log(
+          `Reusing existing category "${fuzzyMatch.name}" (similar to suggested "${name}") with ID ${fuzzyMatch.id}`,
+        );
+        return fuzzyMatch.id;
       }
 
       let pending = pendingCategoryIds.get(key);
@@ -154,6 +189,44 @@ class CategorySuggester {
         }
       },
     );
+  }
+
+  /**
+   * Fuzzy match against existing categories (2.2), tried within the target group
+   * first (a match there is unambiguous — same group the LLM was already
+   * suggesting), then globally across every group if nothing in-group qualifies.
+   * A global match wins over creating a near-duplicate even though it means the
+   * transaction lands in a different group than suggested — the whole point is
+   * avoiding a second "Groceries"-shaped category, not honoring the LLM's group
+   * guess over reality.
+   */
+  private findSimilarExistingCategory(
+    name: string,
+    groupId: string,
+    existingCategoriesWithReps: ExistingCategoryWithRep[],
+  ): { id: string; name: string } | undefined {
+    const rep = this.similarityCalculator.represent(name);
+    const inGroup = existingCategoriesWithReps.filter((c) => c.groupId === groupId);
+    return this.findBestMatch(rep, inGroup) ?? this.findBestMatch(rep, existingCategoriesWithReps);
+  }
+
+  private findBestMatch(
+    rep: NameRepresentation,
+    candidates: ExistingCategoryWithRep[],
+  ): { id: string; name: string } | undefined {
+    let best: { id: string; name: string; score: number } | undefined;
+    candidates.forEach((candidate) => {
+      if (this.similarityCalculator.isDefinitelyDissimilar(rep, candidate.rep)) {
+        return;
+      }
+      const minLength = Math.min(rep.normalized.length, candidate.rep.normalized.length);
+      const threshold = dynamicSimilarityThreshold(minLength);
+      const score = this.similarityCalculator.calculateSimilarity(rep, candidate.rep);
+      if (score >= threshold && (!best || score > best.score)) {
+        best = { id: candidate.id, name: candidate.name, score };
+      }
+    });
+    return best;
   }
 
   private async createCategory(name: string, groupId: string): Promise<string> {

@@ -110,6 +110,81 @@ describe('CategorySuggester', () => {
     expect(updated.category).toBe('hidden-1');
   });
 
+  describe('fuzzy matching against existing categories (2.2)', () => {
+    test('reuses an existing category that is similar (not identical) to the suggestion, in the target group', async () => {
+      const groups = [{
+        id: 'g1',
+        name: 'Food',
+        categories: [{
+          id: 'existing-1', name: 'Groceries', group_id: 'g1', is_income: false,
+        }],
+      }];
+      actualApiService.setCategoryGroups(groups);
+      const createCategory = jest.spyOn(actualApiService, 'createCategory');
+
+      await categorySuggester.suggest(
+        suggestions([{ name: 'Grocery', groupName: 'Food', transactionIds: ['t1'] }]),
+        [transaction('t1')],
+        groups,
+      );
+
+      expect(createCategory).not.toHaveBeenCalled();
+      const [updated] = await actualApiService.getTransactions();
+      expect(updated.category).toBe('existing-1');
+    });
+
+    test('does not fuzzy-match names that are genuinely different', async () => {
+      const groups = [{
+        id: 'g1',
+        name: 'Food',
+        categories: [{
+          id: 'existing-1', name: 'Groceries', group_id: 'g1', is_income: false,
+        }],
+      }];
+      actualApiService.setCategoryGroups(groups);
+      const createCategory = jest.spyOn(actualApiService, 'createCategory').mockResolvedValue('new-cat-id');
+
+      await categorySuggester.suggest(
+        suggestions([{ name: 'Electronics', groupName: 'Food', transactionIds: ['t1'] }]),
+        [transaction('t1')],
+        groups,
+      );
+
+      expect(createCategory).toHaveBeenCalledWith('Electronics', 'g1');
+    });
+
+    test('falls back to a global match when nothing in the target group qualifies', async () => {
+      const groups = [
+        {
+          id: 'g1',
+          name: 'Bills',
+          categories: [],
+        },
+        {
+          id: 'g2',
+          name: 'Food',
+          categories: [{
+            id: 'existing-1', name: 'Groceries', group_id: 'g2', is_income: false,
+          }],
+        },
+      ];
+      actualApiService.setCategoryGroups(groups);
+      const createCategory = jest.spyOn(actualApiService, 'createCategory');
+
+      // The LLM suggested "Bills" for this one, but a similar category already
+      // exists in "Food" — reuse it rather than create a near-duplicate.
+      await categorySuggester.suggest(
+        suggestions([{ name: 'Grocery', groupName: 'Bills', transactionIds: ['t1'] }]),
+        [transaction('t1')],
+        groups,
+      );
+
+      expect(createCategory).not.toHaveBeenCalled();
+      const [updated] = await actualApiService.getTransactions();
+      expect(updated.category).toBe('existing-1');
+    });
+  });
+
   test('refetches categories at most once per suggest() call, even with multiple hidden-category collisions', async () => {
     const groups = [{ id: 'g1', name: 'Bills', categories: [] }];
     actualApiService.setCategoryGroups(groups);
@@ -230,5 +305,88 @@ describe('CategorySuggester', () => {
 
     expect(peak).toBeGreaterThan(1);
     expect(peak).toBeLessThanOrEqual(5);
+  });
+
+  test('several new groups are each created exactly once', async () => {
+    const groups: never[] = [];
+    actualApiService.setCategoryGroups(groups);
+    const createCategoryGroup = jest.spyOn(actualApiService, 'createCategoryGroup');
+    actualApiService.setTransactions(['t1', 't2', 't3'].map(transaction));
+
+    await categorySuggester.suggest(
+      suggestions([
+        { name: 'Streaming', groupName: 'Entertainment', transactionIds: ['t1'] },
+        { name: 'Gaming', groupName: 'Entertainment', transactionIds: ['t2'] },
+        { name: 'Wine', groupName: 'Drinks', transactionIds: ['t3'] },
+      ]),
+      ['t1', 't2', 't3'].map(transaction),
+      groups,
+    );
+
+    expect(createCategoryGroup).toHaveBeenCalledTimes(2);
+    expect(createCategoryGroup).toHaveBeenCalledWith('Entertainment');
+    expect(createCategoryGroup).toHaveBeenCalledWith('Drinks');
+  });
+
+  test('one category failing to create does not stop the rest of the plan', async () => {
+    const groups = [{ id: 'g1', name: 'Bills', categories: [] }];
+    actualApiService.setCategoryGroups(groups);
+    actualApiService.setTransactions(['t1', 't2'].map(transaction));
+    jest.spyOn(actualApiService, 'createCategory').mockImplementation((name) => {
+      if (name === 'Streaming') {
+        return Promise.reject(new Error('permanent failure, not a duplicate-collision'));
+      }
+      return Promise.resolve(`cat-${name}`);
+    });
+
+    await categorySuggester.suggest(
+      suggestions([
+        { name: 'Streaming', groupName: 'Bills', transactionIds: ['t1'] },
+        { name: 'Insurance', groupName: 'Bills', transactionIds: ['t2'] },
+      ]),
+      ['t1', 't2'].map(transaction),
+      groups,
+    );
+
+    const [t1, t2] = await actualApiService.getTransactions();
+    expect(t1.category).toBeUndefined(); // the failed one never got assigned
+    expect(t2.category).toBe('cat-Insurance'); // but its sibling still went through
+  });
+
+  test('an empty suggestion set makes no API calls at all', async () => {
+    const groups = [{ id: 'g1', name: 'Bills', categories: [] }];
+    actualApiService.setCategoryGroups(groups);
+    const createCategory = jest.spyOn(actualApiService, 'createCategory');
+    const createCategoryGroup = jest.spyOn(actualApiService, 'createCategoryGroup');
+    const updateTx = jest.spyOn(actualApiService, 'updateTransactionNotesAndCategory');
+
+    await categorySuggester.suggest(suggestions([]), [], groups);
+
+    expect(createCategory).not.toHaveBeenCalled();
+    expect(createCategoryGroup).not.toHaveBeenCalled();
+    expect(updateTx).not.toHaveBeenCalled();
+  });
+
+  test('dry run: the full planning path runs, but nothing is actually mutated', async () => {
+    const dryRunApi = new InMemoryActualApiService(true);
+    const dryRunSuggester = new CategorySuggester(
+      dryRunApi,
+      new CategorySuggestionOptimizer(new SimilarityCalculator()),
+      new TagService('#actual-ai-miss', '#actual-ai'),
+    );
+    const groups = [{ id: 'g1', name: 'Bills', categories: [] }];
+    dryRunApi.setCategoryGroups(groups);
+    dryRunApi.setTransactions([transaction('t1')]);
+
+    await dryRunSuggester.suggest(
+      suggestions([{ name: 'Streaming', groupName: 'Bills', transactionIds: ['t1'] }]),
+      [transaction('t1')],
+      groups,
+    );
+
+    // Planning ran (we'd see log output either way), but InMemoryActualApiService's
+    // own dry-run guard means the transaction was never actually updated.
+    const [t1] = await dryRunApi.getTransactions();
+    expect(t1.category).toBeUndefined();
   });
 });

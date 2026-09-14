@@ -16,6 +16,45 @@ function newCategoryResponse(name: string, groupName: string): UnifiedResponse {
   };
 }
 
+describe('NewCategoryStrategy case normalization (2.1)', () => {
+  test('Coffee / coffee / COFFEE collapse into one suggestion', async () => {
+    const strategy = new NewCategoryStrategy();
+    const suggestedCategories = new Map<string, {
+      name: string;
+      groupName: string;
+      groupIsNew: boolean;
+      groupId?: string;
+      transactions: TransactionEntity[];
+    }>();
+
+    await strategy.process(transaction('t1'), newCategoryResponse('Coffee', 'Food'), new Map(), suggestedCategories);
+    await strategy.process(transaction('t2'), newCategoryResponse('coffee', 'Food'), new Map(), suggestedCategories);
+    await strategy.process(transaction('t3'), newCategoryResponse('COFFEE', 'FOOD'), new Map(), suggestedCategories);
+
+    expect(suggestedCategories.size).toBe(1);
+    const [entry] = suggestedCategories.values();
+    expect(entry.transactions).toHaveLength(3);
+  });
+
+  test('preserves the first-seen casing for display', async () => {
+    const strategy = new NewCategoryStrategy();
+    const suggestedCategories = new Map<string, {
+      name: string;
+      groupName: string;
+      groupIsNew: boolean;
+      groupId?: string;
+      transactions: TransactionEntity[];
+    }>();
+
+    await strategy.process(transaction('t1'), newCategoryResponse('Coffee Shops', 'Food'), new Map(), suggestedCategories);
+    await strategy.process(transaction('t2'), newCategoryResponse('COFFEE SHOPS', 'food'), new Map(), suggestedCategories);
+
+    const [entry] = suggestedCategories.values();
+    expect(entry.name).toBe('Coffee Shops');
+    expect(entry.groupName).toBe('Food');
+  });
+});
+
 describe('NewCategoryStrategy concurrency', () => {
   test('concurrent calls for the same suggested category do not lose any transaction', async () => {
     const strategy = new NewCategoryStrategy();
@@ -35,7 +74,7 @@ describe('NewCategoryStrategy concurrency', () => {
     });
 
     expect(suggestedCategories.size).toBe(1);
-    const entry = suggestedCategories.get('Pets:Pet Supplies');
+    const entry = suggestedCategories.get('pets:pet supplies');
     expect(entry?.transactions).toHaveLength(50);
     expect(new Set(entry?.transactions.map((t) => t.id)).size).toBe(50);
   });

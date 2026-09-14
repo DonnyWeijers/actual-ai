@@ -677,3 +677,173 @@ plug in real Ollama numbers once you've picked a concurrency to try.
   actual concurrency levels and can't hang; a tighter loop would be solving a problem
   (perfect enforcement at high concurrency against a real external API) this project
   doesn't have.
+
+# Phase 2: category planning quality (P1)
+
+Note on sequencing (same note as Phase 3's, restated here since this is the section
+it points at): this phase was originally skipped by mistake — Phase 3 was built and
+committed first. Caught mid-task, corrected by finishing Phase 3 and landing it before
+coming back to this one, per your call at the time. Nothing in Phase 3's code depends
+on Phase 2 or vice versa, so the two commits are independent regardless of order.
+
+Also per your later instruction ("skip the anthropic stuff", "don't care about
+backward compatibility, I'm the only one using it, keep it simple, lightweight and
+efficient"): no new config surface was added here, and none of this touches the
+Anthropic prompt-caching path from Phase 1.
+
+## 2.1 Case-normalize suggestion keys
+
+`src/transaction/processing-strategy/new-category-strategy.ts`: the key used to
+dedupe an LLM-suggested `(groupName, name)` pair is now
+`` `${groupName}:${name}`.toLowerCase() `` instead of the raw-cased string. The LLM is
+inconsistent about casing across calls for what's clearly the same category
+("Groceries" vs "groceries"), so the old raw-cased key let those collide into two
+separate suggestion-map entries instead of one. The *stored* `name`/`groupName` values
+keep their original casing — only the map key is lowercased, so what actually gets
+created/displayed is unaffected.
+
+Verified: `tests/new-category-strategy.test.ts` — a new `case normalization (2.1)`
+block (2 tests: differently-cased duplicates collapse to one entry; the casing of the
+*first* suggestion seen wins for display). One pre-existing test's key literal was
+updated from `'Pets:Pet Supplies'` to `'pets:pet supplies'` to match — behavior
+didn't change, that test was asserting against the raw key string.
+
+## 2.2 Match suggestions against existing categories
+
+`src/transaction/category-suggester.ts`: before creating a suggested category,
+`resolveCategoryId` now tries a fuzzy match against *every existing category* (not
+just an exact-name hit) via `findSimilarExistingCategory` — first within the
+suggestion's target group, then, if nothing there qualifies, globally across all
+groups. This is the fix for R5: the old exact-match-only check caught "Groceries" vs
+"groceries" but not "Grocery Shopping" landing next to an existing "Groceries" —
+previously that created a real duplicate category every time the LLM phrased the same
+concept slightly differently.
+
+A global match (outside the suggested group) wins over creating a near-duplicate
+category — reusing "Groceries" in `Food` beats creating a new "Grocery Shopping" in
+whatever group the LLM guessed, even though it means the transaction lands somewhere
+other than the LLM's suggested group.
+
+Verified: `tests/category-suggester.test.ts`, `fuzzy matching against existing
+categories (2.2)` block (3 tests: in-group match reused instead of duplicated; a
+genuinely different in-group name is *not* falsely matched; a global match is used
+when nothing in-group qualifies).
+
+## 2.3 Precompute similarity representations + blocking
+
+`src/similarity-calculator.ts` was rewritten around a `NameRepresentation {
+normalized, tokens }` computed once per name (`represent()`), instead of
+`calculateNameSimilarity(name1, name2)` re-normalizing and re-stemming both names on
+every single pairwise call. Both call sites that do O(K²) comparisons —
+`CategorySuggestionOptimizer`'s clustering loop and `CategorySuggester`'s
+match-against-existing-categories loop — now `represent()` each candidate exactly
+once up front and reuse the result for every comparison it's part of.
+
+Also added `isDefinitelyDissimilar(a, b)`: a cheap pre-check that skips the full
+similarity computation (character-level Jaro-Winkler included) when the two token sets
+share nothing. This is provably safe, not a heuristic — worked out directly from the
+similarity formula's own structure: with zero shared stems, `wordSimilarity` is 0 and
+the subset boost requires the *smaller* token set to be fully contained in the
+intersection (impossible at zero overlap with both sets non-empty), so the only
+surviving term is `0.4 * charSimilarity`, capped at 0.4 — below every threshold this
+codebase uses (`dynamicSimilarityThreshold` is always ≥ 0.7). It can only produce a
+false "not dissimilar" (falling through to the full computation unnecessarily), never
+a false "definitely dissimilar."
+
+`calculateSimilarity(a, b)` (the two-representation form) is otherwise the same
+formula as the old `calculateNameSimilarity` — nothing about *what* counts as similar
+changed, only when normalization/stemming happens and how the O(K²) loop reaches it.
+
+Verified: existing `tests/similarity-calculator.test.ts` suite (17 pre-existing tests)
+passes unchanged, plus a new `exact-value regression pin` block (5 `it.each` cases
+covering plurals, -ies/-ation stemming, subset-boost, and a partial-overlap case) added
+*before* the rewrite specifically to catch any accidental score drift — none occurred.
+
+## 2.4 Order-independent clustering
+
+`src/category-suggestion-optimizer.ts` replaced the old greedy single-pass clustering
+(`used: boolean[]`, first name to claim a slot wins, later comparisons against an
+already-claimed name are skipped) with union-find (`src/utils/union-find.ts`): every
+above-threshold pair is `union()`-ed, then clusters are read off by grouping indices
+under their `find()`-root. The old greedy approach's result depended on suggestion
+order — a name mid-cluster could get sorted into a different cluster, or fail to
+merge at all, purely because of which name happened to be visited first. Union-find's
+result depends only on the *set* of above-threshold pairs, not the order they were
+discovered in.
+
+Two remaining non-determinism sources inside a resolved cluster were also fixed for
+the same reason (same input, same output, every time): `chooseBestCategoryName`'s
+score-tie tiebreak and the representative-group selection both now sort
+alphabetically before picking, instead of taking whichever happened to iterate first
+out of a `Map`.
+
+Verified: `tests/category-suggestion-optimizer.test.ts`, new `determinism (2.4)` block
+— builds the same suggestion set in multiple different orders and asserts identical
+clustering (via a `summarize()` helper comparing resulting category names/members) in
+every order.
+
+## 2.5 Preserve transaction → category mapping through merges
+
+When `CategorySuggestionOptimizer` merges N suggestions into one cluster, the union's
+`transactions` array is the flattened concatenation of every merged suggestion's own
+`transactions` (`cluster.flatMap((s) => s.transactions)`) — this was already correct
+in the pre-Phase-2 code and the rewrite preserves it; what's new is that it's now
+covered by an explicit test rather than only exercised incidentally by other cases.
+
+Verified: `tests/category-suggestion-optimizer.test.ts`, new `transaction → final
+category mapping survives merging (2.5)` block — merges two similarly-named
+suggestions with disjoint transaction sets and asserts the merged result's
+transactions is the union of both, with none dropped or duplicated.
+
+## Additional test coverage (required-list items not tied to one numbered item)
+
+Also added to `tests/category-suggester.test.ts`, covering gaps in the required-test
+list that weren't specific to 2.1–2.5 individually:
+
+- **Several new groups, each created exactly once** — 3 suggestions spanning 2 new
+  groups; `createCategoryGroup` is asserted called exactly twice, once per group name.
+- **One category's creation failing doesn't block the rest of the plan** — mocks
+  `createCategory` to reject for one specific name (a real, non-duplicate-collision
+  error); asserts the *other* suggestion in the same run still gets created and its
+  transaction assigned, while the failed one's transaction is left uncategorized
+  rather than the whole `suggest()` call throwing.
+- **An empty suggestion set makes no API calls** — `suggest()` with no suggestions and
+  no uncategorized transactions asserts `createCategory`/`createCategoryGroup`/
+  `updateTransactionNotesAndCategory` are never called.
+- **Dry run runs the full planning path without mutating anything** — a fresh
+  `CategorySuggester` wired to a dry-run `InMemoryActualApiService` still walks
+  clustering/group-resolution/category-resolution, but the transaction's `category`
+  stays `undefined` afterward (the test double's own dry-run guard is what enforces
+  this — this test exists to confirm nothing in the Phase 2 changes bypasses it by,
+  say, mutating local objects directly instead of going through the service).
+
+## Corrections to earlier findings
+
+None. Nothing found while implementing 2.1–2.5 contradicted the Phase 0 R5 hypothesis
+or any other earlier finding.
+
+## What this cannot show
+
+Unlike Phases 1 and 3, this phase has no wall-clock story — it's a correctness/quality
+fix (fewer accidental duplicate categories, deterministic output), not a latency
+optimization, so there's no "before/after ms" table to report here. The one
+performance-adjacent claim — 2.3's precompute-once-per-candidate change turning
+`O(K²)` re-stemming into `O(K)` stemming plus `O(K²)` cheap-set-comparisons — is real
+algorithmically but isn't separately benchmarked, since category-suggestion lists in
+realistic runs are small enough (tens, not thousands) that this was never the
+bottleneck the R-list identified; it was fixed because it was easy and correct to fix
+alongside the clustering rewrite it's part of, not because it was measured as costly.
+
+## What I deliberately did not do, and why
+
+- Did not make the similarity threshold (`dynamicSimilarityThreshold`) user-
+  configurable via an env var — no existing numeric-threshold config in this project
+  to follow the style of, and nobody has asked to tune it. A single well-named
+  exported function is simpler.
+- Did not change the underlying similarity *formula* (word-overlap + Jaro-Winkler +
+  subset boost) — only when it's computed (2.3) and what feeds the clustering
+  decision (2.4). The regression-pin test exists specifically to prove this.
+- Did not extend fuzzy-matching (2.2) to category *groups* — only to categories within
+  a resolved group. Group name matching was out of scope for the R5 hypothesis this
+  addresses, and group creation already has its own race-safe exact-match path from
+  before this project started.

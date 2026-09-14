@@ -1,8 +1,17 @@
 import type {
   TransactionEntity,
 } from '@actual-app/core/src/types/models';
-import SimilarityCalculator from './similarity-calculator';
+import SimilarityCalculator, { NameRepresentation, dynamicSimilarityThreshold } from './similarity-calculator';
 import metrics from './utils/metrics';
+import UnionFind from './utils/union-find';
+
+interface Suggestion {
+  name: string;
+  groupName: string;
+  groupIsNew: boolean;
+  groupId?: string;
+  transactions: TransactionEntity[];
+}
 
 class CategorySuggestionOptimizer {
   private readonly similarityCalculator: SimilarityCalculator;
@@ -14,79 +23,72 @@ class CategorySuggestionOptimizer {
   }
 
   public optimizeCategorySuggestions(
-    suggestedCategories: Map<string, {
-            name: string;
-            groupName: string;
-            groupIsNew: boolean;
-            groupId?: string;
-            transactions: TransactionEntity[];
-        }>,
-  ): Map<string, {
-        name: string;
-        groupName: string;
-        groupIsNew: boolean;
-        groupId?: string;
-        transactions: TransactionEntity[];
-    }> {
+    suggestedCategories: Map<string, Suggestion>,
+  ): Map<string, Suggestion> {
     console.log('Optimizing category suggestions...');
 
-    // Convert suggestions to array.
     const suggestions = Array.from(suggestedCategories.values());
 
-    // Cluster suggestions across groups based on name similarity.
-    const used = new Array(suggestions.length).fill(false);
-    const clusters: { suggestions: typeof suggestions }[] = [];
-    for (let i = 0; i < suggestions.length; i++) {
-      if (used[i]) continue;
-      const cluster = [suggestions[i]];
-      used[i] = true;
-      for (let j = i + 1; j < suggestions.length; j++) {
-        if (used[j]) continue;
-        // Dynamic threshold: shorter names need higher similarity.
+    // Precompute once per unique candidate (2.3) instead of re-normalizing/
+    // re-stemming inside every one of the O(K²) pairwise comparisons below.
+    const representations: NameRepresentation[] = suggestions.map(
+      (s) => this.similarityCalculator.represent(s.name),
+    );
+
+    const unionFind = new UnionFind(suggestions.length);
+    for (let i = 0; i < suggestions.length; i += 1) {
+      for (let j = i + 1; j < suggestions.length; j += 1) {
+        // Cheap, provably-safe skip (see SimilarityCalculator.isDefinitelyDissimilar)
+        // before paying for the full comparison.
+        const repI = representations[i];
+        const repJ = representations[j];
+        if (this.similarityCalculator.isDefinitelyDissimilar(repI, repJ)) {
+          continue;
+        }
         const minLength = Math.min(suggestions[i].name.length, suggestions[j].name.length);
-        const baseThreshold = 0.7;
-        const dynamicThreshold = baseThreshold + (1 / Math.max(5, minLength)) * 0.3;
-        const sim = this.similarityCalculator.calculateNameSimilarity(
-          suggestions[i].name,
-          suggestions[j].name,
-        );
+        const dynamicThreshold = dynamicSimilarityThreshold(minLength);
+        const sim = this.similarityCalculator.calculateSimilarity(repI, repJ);
         if (sim >= dynamicThreshold) {
-          cluster.push(suggestions[j]);
-          used[j] = true;
+          unionFind.union(i, j);
         }
       }
-      clusters.push({ suggestions: cluster });
     }
 
-    // Create optimized categories from clusters.
-    const optimizedCategories = new Map<string, {
-            name: string;
-            groupName: string;
-            groupIsNew: boolean;
-            groupId?: string;
-            transactions: TransactionEntity[];
-            originalNames: string[];
-        }>();
-    clusters.forEach(({ suggestions: cluster }) => {
-      // Merge transactions and original names.
+    // Group indices by root — order-independent by construction (2.4): the same set
+    // of above-threshold pairs always produces the same partition, regardless of
+    // which order they were discovered/unioned in.
+    const clustersByRoot = new Map<number, number[]>();
+    for (let i = 0; i < suggestions.length; i += 1) {
+      const root = unionFind.find(i);
+      const members = clustersByRoot.get(root) ?? [];
+      members.push(i);
+      clustersByRoot.set(root, members);
+    }
+
+    const optimizedCategories = new Map<string, Suggestion & { originalNames: string[] }>();
+    clustersByRoot.forEach((memberIndices) => {
+      const cluster = memberIndices.map((i) => suggestions[i]);
       const mergedTransactions = cluster.flatMap((s) => s.transactions);
       const originalNames = cluster.map((s) => s.name);
       const bestName = this.chooseBestCategoryName(originalNames);
-      // Choose representative group name from frequency.
+
       const groupCount = new Map<string, number>();
       cluster.forEach((s) => {
-        const grp = s.groupName;
-        groupCount.set(grp, (groupCount.get(grp) ?? 0) + 1);
+        groupCount.set(s.groupName, (groupCount.get(s.groupName) ?? 0) + 1);
       });
       let repGroup = cluster[0].groupName;
       let maxCount = 0;
-      groupCount.forEach((cnt, grp) => {
+      // Sorted so a tie between equally-frequent group names resolves the same way
+      // regardless of Map iteration/insertion order.
+      const sortedGroupCounts = Array.from(groupCount.entries())
+        .sort(([a], [b]) => a.localeCompare(b));
+      sortedGroupCounts.forEach(([grp, cnt]) => {
         if (cnt > maxCount) {
           maxCount = cnt;
           repGroup = grp;
         }
       });
-      // Determine groupIsNew: if any in cluster is new, mark true.
+
       const groupIsNew = cluster.some((s) => s.groupIsNew);
       optimizedCategories.set(`${repGroup}:${bestName}`, {
         name: bestName,
@@ -106,7 +108,6 @@ class CategorySuggestionOptimizer {
       }
     });
 
-    // Return map without originalNames.
     return new Map(
       Array.from(optimizedCategories.entries()).map(([key, value]) => [
         key,
@@ -148,8 +149,9 @@ class CategorySuggestionOptimizer {
       return { name, score: freqScore * 0.7 + lengthScore * 0.3 };
     });
 
-    // Sort by score (descending) and return the best
-    scores.sort((a, b) => b.score - a.score);
+    // Sort by score (descending); ties break alphabetically so the result doesn't
+    // depend on the names' original order (2.4 determinism).
+    scores.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
     return scores[0].name;
   }
 }

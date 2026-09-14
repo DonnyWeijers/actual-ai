@@ -28,7 +28,10 @@ class NewCategoryStrategy implements ProcessingStrategyI {
       throw new Error('No newCategory in response');
     }
     metrics.incr('category_suggestions_raw');
-    const categoryKey = `${response.newCategory.groupName}:${response.newCategory.name}`;
+    // Case-normalized so "Coffee"/"coffee"/"COFFEE" collapse into one suggestion
+    // instead of three (R6) — the stored name/groupName below keep whatever casing
+    // the first occurrence used, so display is unaffected.
+    const categoryKey = `${response.newCategory.groupName}:${response.newCategory.name}`.toLowerCase();
 
     // Safe to run concurrently (Phase 3, LLM_CONCURRENCY > 1) without a lock: this
     // get-then-set/push has no `await` anywhere in it, so JS never interleaves

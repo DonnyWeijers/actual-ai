@@ -67,16 +67,11 @@ describe('CategorySuggestionOptimizer', () => {
         transactions: [transaction2],
       });
 
-      jest.spyOn(similarityCalculator, 'calculateNameSimilarity').mockImplementation(
-        (name1, name2) => {
-          if ((name1 === 'Amazon' && name2 === 'amazon.com')
-              || (name1 === 'amazon.com' && name2 === 'Amazon')) {
-            return 0.9;
-          }
-          return 0.0;
-        },
-      );
-
+      // No mock: "Amazon"/"amazon.com" genuinely scores above the merge threshold
+      // (pinned at 0.818 in similarity-calculator.test.ts) via the real calculator —
+      // the optimizer no longer calls calculateNameSimilarity internally (it uses
+      // represent()/calculateSimilarity() to precompute once per candidate), so a
+      // mock on that method wouldn't intercept anything real here.
       const result = optimizer.optimizeCategorySuggestions(suggestedCategories);
 
       // Should merge into one category
@@ -117,8 +112,8 @@ describe('CategorySuggestionOptimizer', () => {
         transactions: [transaction2],
       });
 
-      jest.spyOn(similarityCalculator, 'calculateNameSimilarity').mockReturnValue(0.2);
-
+      // No mock: "Groceries"/"Entertainment" share no stems, so the real calculator
+      // (via isDefinitelyDissimilar's provably-safe skip) scores them 0 regardless.
       const result = optimizer.optimizeCategorySuggestions(suggestedCategories);
 
       // Should not merge
@@ -161,15 +156,8 @@ describe('CategorySuggestionOptimizer', () => {
         transactions: [transaction3],
       });
 
-      jest.spyOn(similarityCalculator, 'calculateNameSimilarity').mockImplementation(
-        (name1, name2) => {
-          if (name1.toLowerCase().includes('coffee') && name2.toLowerCase().includes('coffee')) {
-            return 0.85;
-          }
-          return 0.2;
-        },
-      );
-
+      // No mock: "Coffee"/"Coffee Shop"/"Coffee Place" genuinely score above threshold
+      // via the real calculator (shared "coffee" stem).
       const result = optimizer.optimizeCategorySuggestions(suggestedCategories);
 
       // Should merge into one category
@@ -239,5 +227,92 @@ describe('CategorySuggestionOptimizer', () => {
     // The optimizer should not assign a groupId for new groups.
     // The TransactionService is responsible for creating the group and getting the ID.
     expect(optimizedSuggestion?.groupId).toBeUndefined();
+  });
+
+  describe('determinism (2.4)', () => {
+    function buildSuggestions(order: string[]): Map<string, {
+      name: string;
+      groupName: string;
+      groupIsNew: boolean;
+      groupId?: string;
+      transactions: TransactionEntity[];
+    }> {
+      const byName: Record<string, { name: string; groupName: string }> = {
+        Sport: { name: 'Sport', groupName: 'Fitness' },
+        Sports: { name: 'Sports', groupName: 'Fitness' },
+        Sporting: { name: 'Sporting', groupName: 'Fitness' },
+        Groceries: { name: 'Groceries', groupName: 'Food' },
+        Electronics: { name: 'Electronics', groupName: 'Shopping' },
+      };
+      const map = new Map<string, {
+        name: string;
+        groupName: string;
+        groupIsNew: boolean;
+        groupId?: string;
+        transactions: TransactionEntity[];
+      }>();
+      order.forEach((name, i) => {
+        const def = byName[name];
+        map.set(`${def.groupName}:${def.name}`, {
+          ...def,
+          groupIsNew: false,
+          transactions: [GivenActualData.createTransaction(`tx-${name}`, -100 * (i + 1), name)],
+        });
+      });
+      return map;
+    }
+
+    it('produces the same clustering regardless of input order', () => {
+      const forward = optimizer.optimizeCategorySuggestions(
+        buildSuggestions(['Sport', 'Sports', 'Sporting', 'Groceries', 'Electronics']),
+      );
+      const shuffled = new CategorySuggestionOptimizer(new SimilarityCalculator())
+        .optimizeCategorySuggestions(
+          buildSuggestions(['Electronics', 'Sporting', 'Groceries', 'Sport', 'Sports']),
+        );
+
+      const summarize = (result: typeof forward) => Array.from(result.values())
+        .map((v) => ({
+          groupName: v.groupName,
+          transactionIds: v.transactions.map((t) => t.id).sort(),
+        }))
+        .sort((a, b) => a.transactionIds[0].localeCompare(b.transactionIds[0]));
+
+      expect(summarize(shuffled)).toEqual(summarize(forward));
+      // Sanity: it actually merged (1 cluster for the 3 sport-ish names, not 3).
+      expect(forward.size).toBe(3);
+    });
+  });
+
+  describe('transaction → final category mapping survives merging (2.5)', () => {
+    it('every transaction from every merged name ends up on the single resulting entry', () => {
+      const txSport = GivenActualData.createTransaction('tx1', -100, 'Sport');
+      const txSports = GivenActualData.createTransaction('tx2', -200, 'Sports');
+      const txSporting = GivenActualData.createTransaction('tx3', -300, 'Sporting');
+
+      const suggestedCategories = new Map<string, {
+        name: string;
+        groupName: string;
+        groupIsNew: boolean;
+        groupId?: string;
+        transactions: TransactionEntity[];
+      }>();
+      suggestedCategories.set('Fitness:Sport', {
+        name: 'Sport', groupName: 'Fitness', groupIsNew: false, transactions: [txSport],
+      });
+      suggestedCategories.set('Fitness:Sports', {
+        name: 'Sports', groupName: 'Fitness', groupIsNew: false, transactions: [txSports],
+      });
+      suggestedCategories.set('Fitness:Sporting', {
+        name: 'Sporting', groupName: 'Fitness', groupIsNew: false, transactions: [txSporting],
+      });
+
+      const result = optimizer.optimizeCategorySuggestions(suggestedCategories);
+
+      expect(result.size).toBe(1);
+      const [merged] = result.values();
+      const ids = merged.transactions.map((t) => t.id).sort();
+      expect(ids).toEqual(['tx1', 'tx2', 'tx3']);
+    });
   });
 });
